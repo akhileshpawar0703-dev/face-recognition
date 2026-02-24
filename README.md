@@ -1,22 +1,20 @@
-# Secure Face Detection Lock/Unlock UI (Android-Style Enrollment)
+# Secure Face Detection Lock/Unlock UI (Enhanced)
 
-This project provides a better-looking, user-friendly face lock/unlock app with:
-- improved face recognition stability,
-- secure encrypted storage,
-- Android-phone-like guided face scanning UI for enrollment.
+This version improves recognition reliability and provides an Android-like guided face enrollment experience.
 
-## What is improved
-- Cleaner lock screen UI with status panels and clear instructions.
-- Better face detection/recognition robustness:
-  - histogram equalization + denoise preprocessing,
-  - dual-pass face detection merge,
-  - eye-presence validation,
-  - stable-frame voting before unlock.
-- Android-style enrollment flow:
-  - center ring guide,
-  - progress arc,
-  - auto-capture when face quality and position are valid,
-  - step-by-step prompts (left/right/up/down/near/far).
+## Key fixes for your issue (samples taken but face not recognized)
+- Added **auto threshold calibration** (`--threshold <= 0`) from enrolled samples.
+- Improved preprocessing (CLAHE + denoise) and detection robustness.
+- Added relaxed eye-check logic to avoid false unknown labels in low light.
+- Added stability voting across frames before unlock.
+- Added debug info on screen: `thr=<threshold> best=<score>` so you can tune quickly.
+
+## Android-style enrollment UI
+- Circular face scan ring and progress arc.
+- Guided prompts (left/right/up/down/near/far).
+- Auto capture on good frame quality.
+- Optional manual capture key `s`.
+- Face quality checks: single face, center alignment, distance/size, blur.
 
 ## Install
 
@@ -26,26 +24,25 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Enroll first (recommended)
+## Enroll first
 
 ```bash
-python app.py enroll --name "alice" --samples 8
+python app.py enroll --name "akhilesh" --samples 12
 ```
 
-## Run lock/unlock UI
+## Run lock/unlock
 
 ```bash
-python app.py --camera-index 0 --threshold 50 --stable-frames 4 --cooldown 2.0
+python app.py --camera-index 0 --threshold -1 --stable-frames 4 --cooldown 2.0
 ```
 
-Inside unlock UI:
-- Press `e` to close and then enroll a new face from terminal prompt.
-- Press `q` or `ESC` to quit.
+- `--threshold -1` (or any `<=0`) enables auto calibration (recommended).
+- If still too strict, try manual threshold values: `70`, `80`, `90`.
+- If false unlocks happen, increase `--stable-frames`.
 
-## Accuracy tuning
-- Lower `--threshold` => stricter matching (fewer false unlocks).
-- Higher `--stable-frames` => more consistent recognition required before unlock.
-- Enroll in good lighting and collect diverse samples (angles/distances).
+## During runtime
+- `e` inside unlock window -> close and start new enrollment prompt.
+- `q` or `ESC` -> quit.
 
 ## Secure data
 Stored in `secure_data/`:
@@ -53,4 +50,4 @@ Stored in `secure_data/`:
 - `face_samples.enc`
 - `recognition_audit.log.enc`
 
-All sensitive files are encrypted; key/data files are set with restricted permissions where supported.
+All stored samples/audit entries are encrypted.
