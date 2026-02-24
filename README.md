@@ -1,31 +1,16 @@
-# Face Detection Lock/Unlock UI (Person Specific)
+# Secure Face Detection Lock/Unlock UI
 
-This project implements a webcam-based lock/unlock UI using **OpenCV + face_recognition**.
+This app provides a webcam-based lock/unlock UI with **person-specific face recognition** and **encrypted data storage**.
 
-## Features
-- Detects faces from live camera feed.
-- Matches only against known/authorized people.
-- Shows **LOCKED** when no authorized face is detected.
-- Shows **UNLOCKED** state and personalized welcome message when a known face is matched.
-- Supports different welcome messages for different people.
-
-## Folder structure
-
-```text
-face-recognition/
-├── app.py
-├── requirements.txt
-└── known_faces/
-    ├── alice/
-    │   ├── 1.jpg
-    │   └── 2.jpg
-    ├── bob/
-    │   └── 1.jpg
-    └── charlie/
-        └── 1.jpg
-```
-
-Each subfolder name under `known_faces/` is treated as the person's name.
+## What is implemented
+- Real-time face detection using OpenCV + `face_recognition`.
+- Unlock only when the detected face matches an enrolled authorized person.
+- Person-specific welcome text after successful unlock.
+- **Enroll mode** to add a new face from webcam.
+- Encrypted storage for:
+  - known face encodings (`secure_data/known_faces.enc`)
+  - detection audit log (`secure_data/recognition_audit.log.enc`)
+- Encryption key file created with restricted permissions (`chmod 600`).
 
 ## Install
 
@@ -35,17 +20,35 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> Note: `face-recognition` depends on `dlib`. On Linux you may need build tools (`cmake`, `build-essential`, python headers).
-
-## Run
+## Enroll a new face (required first)
 
 ```bash
-python app.py --known-faces-dir known_faces --camera-index 0 --threshold 0.45 --cooldown 2.0
+python app.py enroll --name "alice"
+```
+
+During enrollment:
+- keep exactly one face visible.
+- press `s` to save that face.
+- press `q` to cancel.
+
+## Run lock/unlock UI
+
+```bash
+python app.py --camera-index 0 --threshold 0.45 --cooldown 2.0
 ```
 
 Press `q` or `ESC` to quit.
 
-## Custom welcome messages
+## Optional config
+
+```bash
+python app.py \
+  --secure-dir secure_data \
+  --key-file secure_data/face_store.key \
+  --camera-index 0
+```
+
+## Personalized greetings
 
 Edit `WELCOME_MESSAGES` in `app.py`:
 
@@ -56,7 +59,7 @@ WELCOME_MESSAGES = {
 }
 ```
 
-Any recognized person not listed there gets the default:
+Anyone not listed receives:
 
 ```text
 Welcome, <Name>!
