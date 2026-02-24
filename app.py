@@ -3,6 +3,7 @@ import json
 import os
 import pickle
 import time
+import urllib.request
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +32,8 @@ ENROLL_STEPS = [
     "Look straight again",
 ]
 
+YUNET_URL = "https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx"
+
 
 @dataclass
 class MatchResult:
@@ -44,6 +47,8 @@ class SecureFaceStore:
     def __init__(self, secure_dir: Path, key_file: Optional[Path] = None) -> None:
         self.secure_dir = secure_dir
         self.secure_dir.mkdir(parents=True, exist_ok=True)
+        self.model_dir = self.secure_dir / "models"
+        self.model_dir.mkdir(parents=True, exist_ok=True)
         self.key_file = key_file or (self.secure_dir / "face_store.key")
         self.samples_file = self.secure_dir / "face_samples.enc"
         self.audit_file = self.secure_dir / "recognition_audit.log.enc"
@@ -94,14 +99,63 @@ class SecureFaceStore:
         os.chmod(self.audit_file, 0o600)
 
 
+class FaceDetector:
+    def __init__(self, model_dir: Path, detector_mode: str = "auto") -> None:
+        self.detector_mode = detector_mode
+        self.yunet = None
+        self.haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+        if detector_mode in ("auto", "yunet"):
+            self.yunet = self._load_yunet(model_dir)
+        if detector_mode == "yunet" and self.yunet is None:
+            raise RuntimeError("YuNet detector requested but could not be loaded.")
+
+    def _load_yunet(self, model_dir: Path):
+        try:
+            model_path = model_dir / "face_detection_yunet_2023mar.onnx"
+            if not model_path.exists():
+                urllib.request.urlretrieve(YUNET_URL, model_path)
+            detector = cv2.FaceDetectorYN_create(
+                str(model_path),
+                "",
+                (320, 320),
+                score_threshold=0.7,
+                nms_threshold=0.3,
+                top_k=5000,
+            )
+            print("[INFO] Detection backend: YuNet")
+            return detector
+        except Exception:
+            print("[WARN] YuNet unavailable, fallback to Haar cascade")
+            return None
+
+    def detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        h, w = frame.shape[:2]
+        boxes: List[Tuple[int, int, int, int]] = []
+
+        if self.yunet is not None:
+            self.yunet.setInputSize((w, h))
+            _, faces = self.yunet.detect(frame)
+            if faces is not None:
+                for row in faces:
+                    x, y, bw, bh = row[:4]
+                    x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+                    if bw > 20 and bh > 20:
+                        boxes.append((x, y, bw, bh))
+                return boxes
+
+        min_size = max(60, min(h, w) // 8)
+        faces = self.haar.detectMultiScale(frame, scaleFactor=1.15, minNeighbors=5, minSize=(min_size, min_size))
+        for x, y, bw, bh in faces:
+            boxes.append((int(x), int(y), int(bw), int(bh)))
+        return boxes
+
+
 class FaceEngine:
-    def __init__(self, samples: Dict[str, List[np.ndarray]], threshold: float) -> None:
+    def __init__(self, samples: Dict[str, List[np.ndarray]], threshold: float, detector: FaceDetector) -> None:
         if not hasattr(cv2, "face"):
             raise RuntimeError("OpenCV face module missing. Install opencv-contrib-python.")
 
-        self.face_detector = cv2.CascadeClassifier(
-            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-        )
+        self.detector = detector
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=16, grid_x=8, grid_y=8)
         self.id_to_name: Dict[int, str] = {}
 
@@ -113,14 +167,6 @@ class FaceEngine:
         face = cv2.resize(face_gray, FACE_SIZE)
         face = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(face)
         return cv2.GaussianBlur(face, (3, 3), 0)
-
-    def _detect_faces(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        return self.face_detector.detectMultiScale(
-            gray,
-            scaleFactor=1.2,
-            minNeighbors=6,
-            minSize=(90, 90),
-        )
 
     def _train(self, samples: Dict[str, List[np.ndarray]]) -> None:
         faces: List[np.ndarray] = []
@@ -138,34 +184,35 @@ class FaceEngine:
         self.training_faces = faces
 
     def _calibrate_threshold(self) -> float:
-        scores: List[float] = []
-        for face in self.training_faces:
-            _, conf = self.recognizer.predict(face)
-            scores.append(float(conf))
+        scores = [float(self.recognizer.predict(face)[1]) for face in self.training_faces]
         p95 = np.percentile(scores, 95) if scores else 80.0
-        threshold = float(np.clip(p95 + 20.0, 60.0, 130.0))
+        threshold = float(np.clip(p95 + 25.0, 65.0, 130.0))
         print(f"[INFO] Auto threshold selected: {threshold:.1f}")
         return threshold
 
-    def recognize(self, frame: np.ndarray) -> List[MatchResult]:
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        boxes = self._detect_faces(gray)
+    def detect_faces(self, frame_bgr: np.ndarray) -> List[Tuple[int, int, int, int]]:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        return self.detector.detect(gray if self.detector.yunet is None else frame_bgr)
+
+    def recognize(self, frame_bgr: np.ndarray) -> List[MatchResult]:
+        gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+        boxes = self.detect_faces(frame_bgr)
         results: List[MatchResult] = []
 
         for x, y, w, h in boxes:
+            x = max(0, x)
+            y = max(0, y)
+            w = min(w, gray.shape[1] - x)
+            h = min(h, gray.shape[0] - y)
+            if w <= 0 or h <= 0:
+                continue
+
             crop = gray[y : y + h, x : x + w]
             processed = self._preprocess(crop)
             label_id, confidence = self.recognizer.predict(processed)
             predicted = self.id_to_name.get(label_id, "unknown")
             final = predicted if confidence <= self.threshold else "unknown"
-            results.append(
-                MatchResult(
-                    location=(y, x + w, y + h, x),
-                    predicted_label=predicted,
-                    final_label=final,
-                    confidence=float(confidence),
-                )
-            )
+            results.append(MatchResult((y, x + w, y + h, x), predicted, final, float(confidence)))
 
         return results
 
@@ -178,12 +225,14 @@ class FaceUnlockUI:
         confidence_threshold: float,
         cooldown_seconds: float,
         stable_frames: int,
+        detector_mode: str,
     ) -> None:
         self.secure_store = secure_store
         self.camera_index = camera_index
         self.cooldown_seconds = cooldown_seconds
-        self.stable_frames = max(stable_frames, 3)
-        self.engine = FaceEngine(secure_store.load_samples(), threshold=confidence_threshold)
+        self.stable_frames = max(stable_frames, 2)
+        detector = FaceDetector(secure_store.model_dir, detector_mode=detector_mode)
+        self.engine = FaceEngine(secure_store.load_samples(), threshold=confidence_threshold, detector=detector)
 
         self.history: Deque[str] = deque(maxlen=self.stable_frames)
         self.last_unlock_time = 0.0
@@ -300,8 +349,8 @@ class FaceUnlockUI:
 
 def _draw_face_grid(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[int, int, int, int]:
     h, w = frame.shape[:2]
-    grid_w = int(w * 0.42)
-    grid_h = int(h * 0.58)
+    grid_w = int(w * 0.45)
+    grid_h = int(h * 0.62)
     x1 = (w - grid_w) // 2
     y1 = (h - grid_h) // 2
     x2 = x1 + grid_w
@@ -312,15 +361,12 @@ def _draw_face_grid(frame: np.ndarray, progress: float, step_text: str, status: 
     cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
 
     cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 120), 2)
-
-    # grid lines
     for i in (1, 2):
         gx = x1 + (grid_w * i) // 3
         gy = y1 + (grid_h * i) // 3
         cv2.line(frame, (gx, y1), (gx, y2), (0, 190, 105), 1)
         cv2.line(frame, (x1, gy), (x2, gy), (0, 190, 105), 1)
 
-    # progress bar
     bar_y = y2 + 14
     cv2.rectangle(frame, (x1, bar_y), (x2, bar_y + 12), (90, 90, 90), 1)
     fill = int((x2 - x1 - 2) * max(0.0, min(1.0, progress)))
@@ -330,39 +376,39 @@ def _draw_face_grid(frame: np.ndarray, progress: float, step_text: str, status: 
     cv2.putText(frame, step_text, (x1, y2 + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 2)
     cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
     cv2.putText(frame, "q cancel | s manual capture", (x1, y2 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1)
-
     return x1, y1, x2, y2
 
 
-def _extract_enroll_face(gray: np.ndarray, guide_rect: Tuple[int, int, int, int]) -> Tuple[Optional[np.ndarray], str]:
-    detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    boxes = detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=6, minSize=(90, 90))
+def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide_rect: Tuple[int, int, int, int]) -> Tuple[Optional[np.ndarray], str]:
+    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    faces = detector.detect(frame_bgr if detector.yunet is not None else gray)
+    if not faces:
+        return None, "No face detected"
 
-    if len(boxes) != 1:
-        return None, "Keep exactly one face visible"
-
+    # choose largest face to avoid strict single-face failure
+    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
     x1, y1, x2, y2 = guide_rect
-    x, y, w, h = boxes[0]
-    face_x2, face_y2 = x + w, y + h
+    fx2, fy2 = x + w, y + h
 
-    # overlap with guide region
     inter_x1 = max(x, x1)
     inter_y1 = max(y, y1)
-    inter_x2 = min(face_x2, x2)
-    inter_y2 = min(face_y2, y2)
+    inter_x2 = min(fx2, x2)
+    inter_y2 = min(fy2, y2)
     inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
     area = w * h
-    overlap = (inter / area) if area else 0
-    if overlap < 0.7:
-        return None, "Align full face inside grid"
+    overlap = inter / area if area else 0
+    if overlap < 0.45:
+        return None, "Align face inside grid"
 
     guide_w = x2 - x1
-    if not (guide_w * 0.45 <= w <= guide_w * 0.90):
+    if not (guide_w * 0.35 <= w <= guide_w * 1.05):
         return None, "Move slightly closer/farther"
 
-    crop = gray[y:face_y2, x:face_x2]
+    crop = gray[max(0, y):max(0, y) + h, max(0, x):max(0, x) + w]
+    if crop.size == 0:
+        return None, "Face crop failed"
     blur = cv2.Laplacian(crop, cv2.CV_64F).var()
-    if blur < 60:
+    if blur < 40:
         return None, "Hold still (blurry frame)"
 
     face = cv2.resize(crop, FACE_SIZE)
@@ -370,11 +416,18 @@ def _extract_enroll_face(gray: np.ndarray, guide_rect: Tuple[int, int, int, int]
     return face, "Good capture"
 
 
-def enroll_new_face_with_grid(store: SecureFaceStore, name: str, camera_index: int, samples_count: int) -> None:
+def enroll_new_face_with_grid(
+    store: SecureFaceStore,
+    name: str,
+    camera_index: int,
+    samples_count: int,
+    detector_mode: str,
+) -> None:
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {camera_index}")
 
+    detector = FaceDetector(store.model_dir, detector_mode=detector_mode)
     saved = 0
     last_capture = 0.0
     print("Face grid scan started. Follow prompts on screen.")
@@ -391,12 +444,11 @@ def enroll_new_face_with_grid(store: SecureFaceStore, name: str, camera_index: i
             progress = saved / max(samples_count, 1)
             guide_rect = _draw_face_grid(frame, progress, step_text, "Position your face in the grid")
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            face, status = _extract_enroll_face(gray, guide_rect)
-            x1, y1, _, y2 = guide_rect
+            face, status = _extract_enroll_face(detector, frame, guide_rect)
+            x1, _, _, y2 = guide_rect
             cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
 
-            if face is not None and (time.time() - last_capture) > 0.6:
+            if face is not None and (time.time() - last_capture) > 0.5:
                 store.add_sample(name, face)
                 saved += 1
                 last_capture = time.time()
@@ -425,14 +477,10 @@ def enroll_new_face_with_grid(store: SecureFaceStore, name: str, camera_index: i
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Secure face lock/unlock UI")
     parser.add_argument("--camera-index", type=int, default=0)
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=-1,
-        help="LBPH threshold; <=0 enables auto-calibration (recommended)",
-    )
+    parser.add_argument("--threshold", type=float, default=-1, help="LBPH threshold; <=0 enables auto-calibration")
     parser.add_argument("--cooldown", type=float, default=2.0)
-    parser.add_argument("--stable-frames", type=int, default=3)
+    parser.add_argument("--stable-frames", type=int, default=2)
+    parser.add_argument("--detector", choices=["auto", "yunet", "haar"], default="auto")
     parser.add_argument("--secure-dir", type=Path, default=Path("secure_data"))
     parser.add_argument("--key-file", type=Path, default=None)
 
@@ -449,7 +497,7 @@ def main() -> None:
     store = SecureFaceStore(args.secure_dir, args.key_file)
 
     if args.command == "enroll":
-        enroll_new_face_with_grid(store, args.name, args.camera_index, args.samples)
+        enroll_new_face_with_grid(store, args.name, args.camera_index, args.samples, detector_mode=args.detector)
         return
 
     while True:
@@ -459,13 +507,13 @@ def main() -> None:
             confidence_threshold=args.threshold,
             cooldown_seconds=args.cooldown,
             stable_frames=args.stable_frames,
+            detector_mode=args.detector,
         )
         enroll_requested = app.run()
-
         if enroll_requested:
             person = input("Enter person name to enroll: ").strip()
             if person:
-                enroll_new_face_with_grid(store, person, args.camera_index, samples_count=12)
+                enroll_new_face_with_grid(store, person, args.camera_index, samples_count=12, detector_mode=args.detector)
             continue
         break
 

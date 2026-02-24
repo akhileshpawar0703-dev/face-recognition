@@ -1,21 +1,21 @@
-# Secure Face Detection Lock/Unlock UI (Enhanced)
+# Secure Face Detection Lock/Unlock UI (Detection-Fixed)
 
-This build focuses on two things you requested:
-1) stronger recognition (fixes "samples captured but still unknown"),
-2) **face grid** enrollment UI (instead of circular ring).
+This update specifically targets your latest issue: **face not being detected reliably**.
 
-## What changed
-- Reverted detection behavior closer to the previously working setup:
-  - single-pass Haar detection (`scaleFactor=1.2`, `minNeighbors=6`).
-- Improved recognition reliability:
-  - auto threshold calibration from your enrolled samples when `--threshold <= 0`,
-  - stronger preprocessing (CLAHE + slight blur),
-  - clearer overlay showing `unknown (predicted_name)` and score.
-- Replaced ring scanner with **face grid scanner**:
-  - 3x3 face grid region,
-  - overlap/size checks against grid,
-  - blur quality check,
-  - auto capture + manual capture (`s`).
+## What changed for detection reliability
+- Added a new detector layer with selectable backend:
+  - `--detector auto` (default): tries **YuNet** first, then falls back to Haar
+  - `--detector yunet`: force YuNet
+  - `--detector haar`: force Haar
+- YuNet model auto-downloads once into `secure_data/models/`.
+- Enrollment now uses the same detector backend as runtime.
+- Enrollment grid checks were relaxed to avoid rejecting valid face captures.
+- Stable unlock default lowered to `--stable-frames 2` to avoid over-strict gating.
+
+## Face-grid enrollment (requested)
+- Ring is removed.
+- 3x3 face grid guide + progress bar.
+- Auto capture + manual capture (`s`).
 
 ## Install
 
@@ -25,31 +25,27 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Enroll face first
+## Enroll
 
 ```bash
-python app.py enroll --name "akhilesh" --samples 12
+python app.py enroll --name "akhilesh" --samples 12 --detector auto
 ```
 
-## Run unlock UI
+## Run
 
 ```bash
-python app.py --camera-index 0 --threshold -1 --stable-frames 3 --cooldown 2.0
+python app.py --camera-index 0 --threshold -1 --stable-frames 2 --detector auto
 ```
 
-### Tuning
-- Start with `--threshold -1` (auto threshold).
-- If still not recognizing, try manual threshold: `80`, `90`, `100`.
-- Increase `--stable-frames` for stricter unlock behavior.
-
-## Runtime keys
-- `e`: enroll new face.
-- `q` / `ESC`: quit.
+## Tuning if still not detecting
+1. Try `--detector yunet` first.
+2. If network blocks model download, use `--detector haar`.
+3. Increase threshold manually: `--threshold 90` or `--threshold 110`.
+4. Ensure bright frontal lighting and re-enroll.
 
 ## Secure data
-Stored under `secure_data/`:
+Stored in `secure_data/`:
 - `face_store.key`
 - `face_samples.enc`
 - `recognition_audit.log.enc`
-
-All face samples and audit records are encrypted.
+- `models/face_detection_yunet_2023mar.onnx` (if YuNet used)
