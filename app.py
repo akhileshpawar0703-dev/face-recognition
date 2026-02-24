@@ -38,7 +38,6 @@ class MatchResult:
     predicted_label: str
     final_label: str
     confidence: float
-    eyes_ok: bool
 
 
 class SecureFaceStore:
@@ -61,22 +60,25 @@ class SecureFaceStore:
     def load_samples(self) -> Dict[str, List[np.ndarray]]:
         if not self.samples_file.exists():
             return {}
-        raw = self.cipher.decrypt(self.samples_file.read_bytes())
-        data = pickle.loads(raw)
+        payload = self.cipher.decrypt(self.samples_file.read_bytes())
+        data = pickle.loads(payload)
         return {
             name: [np.array(sample, dtype=np.uint8) for sample in sample_list]
             for name, sample_list in data.items()
         }
 
     def save_samples(self, samples: Dict[str, List[np.ndarray]]) -> None:
-        serializable = {name: [x.tolist() for x in sample_list] for name, sample_list in samples.items()}
+        serializable = {
+            name: [sample.tolist() for sample in sample_list]
+            for name, sample_list in samples.items()
+        }
         self.samples_file.write_bytes(self.cipher.encrypt(pickle.dumps(serializable)))
         os.chmod(self.samples_file, 0o600)
 
     def add_sample(self, name: str, face_image: np.ndarray) -> None:
-        name = name.strip().lower()
+        normalized = name.strip().lower()
         samples = self.load_samples()
-        samples.setdefault(name, []).append(face_image)
+        samples.setdefault(normalized, []).append(face_image)
         self.save_samples(samples)
 
     def append_audit_event(self, label: str, confidence: float, unlocked: bool) -> None:
@@ -97,16 +99,14 @@ class FaceEngine:
         if not hasattr(cv2, "face"):
             raise RuntimeError("OpenCV face module missing. Install opencv-contrib-python.")
 
-        self.face_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-        self.eye_detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_eye.xml")
+        self.face_detector = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=16, grid_x=8, grid_y=8)
         self.id_to_name: Dict[int, str] = {}
 
         self._train(samples)
-        if threshold <= 0:
-            self.threshold = self._calibrate_threshold()
-        else:
-            self.threshold = threshold
+        self.threshold = threshold if threshold > 0 else self._calibrate_threshold()
 
     @staticmethod
     def _preprocess(face_gray: np.ndarray) -> np.ndarray:
@@ -114,37 +114,17 @@ class FaceEngine:
         face = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(face)
         return cv2.GaussianBlur(face, (3, 3), 0)
 
-    def _has_eyes(self, face_gray: np.ndarray) -> bool:
-        eyes = self.eye_detector.detectMultiScale(face_gray, scaleFactor=1.1, minNeighbors=4, minSize=(16, 16))
-        return len(eyes) >= 1
-
     def _detect_faces(self, gray: np.ndarray) -> List[Tuple[int, int, int, int]]:
-        eq = cv2.equalizeHist(gray)
-        a = self.face_detector.detectMultiScale(gray, scaleFactor=1.15, minNeighbors=6, minSize=(80, 80))
-        b = self.face_detector.detectMultiScale(eq, scaleFactor=1.12, minNeighbors=5, minSize=(80, 80))
-
-        merged: List[Tuple[int, int, int, int]] = []
-        for faces in (a, b):
-            for x, y, w, h in faces:
-                keep = True
-                for mx, my, mw, mh in merged:
-                    inter_x1 = max(x, mx)
-                    inter_y1 = max(y, my)
-                    inter_x2 = min(x + w, mx + mw)
-                    inter_y2 = min(y + h, my + mh)
-                    inter_area = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-                    union = w * h + mw * mh - inter_area
-                    if union and (inter_area / union) > 0.35:
-                        keep = False
-                        break
-                if keep:
-                    merged.append((x, y, w, h))
-        return merged
+        return self.face_detector.detectMultiScale(
+            gray,
+            scaleFactor=1.2,
+            minNeighbors=6,
+            minSize=(90, 90),
+        )
 
     def _train(self, samples: Dict[str, List[np.ndarray]]) -> None:
         faces: List[np.ndarray] = []
         labels: List[int] = []
-
         for idx, (name, sample_list) in enumerate(sorted(samples.items())):
             self.id_to_name[idx] = name
             for sample in sample_list:
@@ -155,17 +135,17 @@ class FaceEngine:
             raise RuntimeError("No enrolled faces found. Run: python app.py enroll --name <person>")
 
         self.recognizer.train(faces, np.array(labels, dtype=np.int32))
-        self._training_faces = faces
+        self.training_faces = faces
 
     def _calibrate_threshold(self) -> float:
         scores: List[float] = []
-        for face in self._training_faces:
+        for face in self.training_faces:
             _, conf = self.recognizer.predict(face)
             scores.append(float(conf))
-        p95 = np.percentile(scores, 95) if scores else 70.0
-        calibrated = float(np.clip(p95 + 12.0, 48.0, 105.0))
-        print(f"[INFO] Auto-calibrated threshold: {calibrated:.1f}")
-        return calibrated
+        p95 = np.percentile(scores, 95) if scores else 80.0
+        threshold = float(np.clip(p95 + 20.0, 60.0, 130.0))
+        print(f"[INFO] Auto threshold selected: {threshold:.1f}")
+        return threshold
 
     def recognize(self, frame: np.ndarray) -> List[MatchResult]:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -174,22 +154,16 @@ class FaceEngine:
 
         for x, y, w, h in boxes:
             crop = gray[y : y + h, x : x + w]
-            proc = self._preprocess(crop)
-            label_id, confidence = self.recognizer.predict(proc)
+            processed = self._preprocess(crop)
+            label_id, confidence = self.recognizer.predict(processed)
             predicted = self.id_to_name.get(label_id, "unknown")
-
-            eyes_ok = self._has_eyes(proc)
-            eye_relaxed = confidence <= (self.threshold * 0.75)
-            accept = confidence <= self.threshold and (eyes_ok or eye_relaxed)
-            final_label = predicted if accept else "unknown"
-
+            final = predicted if confidence <= self.threshold else "unknown"
             results.append(
                 MatchResult(
                     location=(y, x + w, y + h, x),
                     predicted_label=predicted,
-                    final_label=final_label,
+                    final_label=final,
                     confidence=float(confidence),
-                    eyes_ok=eyes_ok,
                 )
             )
 
@@ -227,16 +201,16 @@ class FaceUnlockUI:
         cv2.addWeighted(overlay, 0.75, frame, 0.25, 0, frame)
 
     def _draw_ui(self, frame: np.ndarray, state: str, greeting: str, faces: int, best_score: float) -> None:
-        state_color = (0, 200, 0) if state == "UNLOCKED" else (0, 0, 230)
+        color = (0, 200, 0) if state == "UNLOCKED" else (0, 0, 230)
         self._panel(frame, 0, 82)
         self._panel(frame, frame.shape[0] - 56, frame.shape[0])
 
         cv2.putText(frame, "Secure Face Unlock", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (236, 236, 236), 2)
-        cv2.putText(frame, f"Status: {state}", (14, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.72, state_color, 2)
+        cv2.putText(frame, f"Status: {state}", (14, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
         cv2.putText(frame, greeting, (295, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (248, 248, 248), 2)
 
-        info = f"thr={self.engine.threshold:.1f} best={best_score:.1f}"
-        cv2.putText(frame, info, (14, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
+        metrics = f"thr={self.engine.threshold:.1f} best={best_score:.1f}"
+        cv2.putText(frame, metrics, (14, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
         cv2.putText(frame, "q/ESC quit | e enroll", (250, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
         cv2.putText(frame, f"Detected: {faces}", (frame.shape[1] - 150, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
 
@@ -256,21 +230,21 @@ class FaceUnlockUI:
                 results = self.engine.recognize(frame)
                 now = time.time()
                 best_score = 999.0
-                best_final = "unknown"
+                best_label = "unknown"
 
-                for res in results:
-                    top, right, bottom, left = res.location
-                    if res.confidence < best_score:
-                        best_score = res.confidence
-                        best_final = res.final_label
+                for result in results:
+                    top, right, bottom, left = result.location
+                    if result.confidence < best_score:
+                        best_score = result.confidence
+                        best_label = result.final_label
 
-                    known = res.final_label != "unknown"
+                    known = result.final_label != "unknown"
+                    shown = result.final_label if known else f"unknown ({result.predicted_label})"
                     color = (0, 190, 0) if known else (0, 0, 230)
-                    shown_name = res.final_label if known else f"unknown ({res.predicted_label})"
                     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
                     cv2.putText(
                         frame,
-                        f"{shown_name} | score {res.confidence:.1f}",
+                        f"{shown} | score {result.confidence:.1f}",
                         (left, max(16, top - 8)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.54,
@@ -278,29 +252,30 @@ class FaceUnlockUI:
                         2,
                     )
 
-                self.history.append(best_final)
+                self.history.append(best_label)
                 known_hist = [x for x in self.history if x != "unknown"]
+
                 unlocked = False
-                current = None
+                person = None
                 if len(known_hist) >= self.stable_frames:
                     label, votes = Counter(known_hist).most_common(1)[0]
                     if votes >= self.stable_frames:
                         unlocked = True
-                        current = label
+                        person = label
 
-                if unlocked and current:
-                    self.last_person = current
+                if unlocked and person:
+                    self.last_person = person
                     self.last_unlock_time = now
                     state = "UNLOCKED"
-                    greeting = self._personalized(current)
-                    audit_label = current
+                    greeting = self._personalized(person)
+                    audit_label = person
                 elif (now - self.last_unlock_time) < self.cooldown_seconds and self.last_person:
                     state = "UNLOCKED"
                     greeting = self._personalized(self.last_person)
                     audit_label = self.last_person
                 else:
                     state = "LOCKED"
-                    greeting = "Locked: align face and look at camera"
+                    greeting = "Locked: align your face inside camera frame"
                     audit_label = "unknown"
 
                 self._draw_ui(frame, state, greeting, len(results), best_score)
@@ -323,60 +298,86 @@ class FaceUnlockUI:
         return enroll_requested
 
 
-def _draw_scan_ui(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[Tuple[int, int], int]:
+def _draw_face_grid(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[int, int, int, int]:
     h, w = frame.shape[:2]
-    center = (w // 2, h // 2 + 20)
-    radius = min(w, h) // 5
+    grid_w = int(w * 0.42)
+    grid_h = int(h * 0.58)
+    x1 = (w - grid_w) // 2
+    y1 = (h - grid_h) // 2
+    x2 = x1 + grid_w
+    y2 = y1 + grid_h
 
     overlay = frame.copy()
-    cv2.circle(overlay, center, radius + 26, (25, 25, 36), -1)
-    cv2.addWeighted(overlay, 0.52, frame, 0.48, 0, frame)
+    cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 140, 80), -1)
+    cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
 
-    cv2.circle(frame, center, radius, (90, 90, 90), 2)
-    end_angle = int(360 * max(0.0, min(1.0, progress)))
-    cv2.ellipse(frame, center, (radius, radius), -90, 0, end_angle, (0, 220, 120), 6)
+    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 120), 2)
 
-    cv2.putText(frame, "Android-style Face Scan", (center[0] - 150, 44), cv2.FONT_HERSHEY_SIMPLEX, 0.82, (240, 240, 240), 2)
-    cv2.putText(frame, step_text, (center[0] - 160, h - 72), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (240, 240, 240), 2)
-    cv2.putText(frame, status, (center[0] - 160, h - 42), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 210, 130), 2)
-    cv2.putText(frame, "q cancel | s manual capture", (center[0] - 160, h - 14), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (210, 210, 210), 1)
-    return center, radius
+    # grid lines
+    for i in (1, 2):
+        gx = x1 + (grid_w * i) // 3
+        gy = y1 + (grid_h * i) // 3
+        cv2.line(frame, (gx, y1), (gx, y2), (0, 190, 105), 1)
+        cv2.line(frame, (x1, gy), (x2, gy), (0, 190, 105), 1)
+
+    # progress bar
+    bar_y = y2 + 14
+    cv2.rectangle(frame, (x1, bar_y), (x2, bar_y + 12), (90, 90, 90), 1)
+    fill = int((x2 - x1 - 2) * max(0.0, min(1.0, progress)))
+    cv2.rectangle(frame, (x1 + 1, bar_y + 1), (x1 + 1 + fill, bar_y + 11), (0, 210, 120), -1)
+
+    cv2.putText(frame, "Face Scan", (x1, y1 - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (240, 240, 240), 2)
+    cv2.putText(frame, step_text, (x1, y2 + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 2)
+    cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
+    cv2.putText(frame, "q cancel | s manual capture", (x1, y2 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1)
+
+    return x1, y1, x2, y2
 
 
-def _extract_enroll_face(gray: np.ndarray, center: Tuple[int, int], radius: int) -> Tuple[Optional[np.ndarray], str]:
+def _extract_enroll_face(gray: np.ndarray, guide_rect: Tuple[int, int, int, int]) -> Tuple[Optional[np.ndarray], str]:
     detector = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
-    boxes = detector.detectMultiScale(gray, scaleFactor=1.12, minNeighbors=5, minSize=(90, 90))
+    boxes = detector.detectMultiScale(gray, scaleFactor=1.2, minNeighbors=6, minSize=(90, 90))
 
     if len(boxes) != 1:
         return None, "Keep exactly one face visible"
 
+    x1, y1, x2, y2 = guide_rect
     x, y, w, h = boxes[0]
-    face_cx, face_cy = x + w // 2, y + h // 2
-    dist = ((face_cx - center[0]) ** 2 + (face_cy - center[1]) ** 2) ** 0.5
-    if dist > radius * 0.62:
-        return None, "Center your face inside the ring"
+    face_x2, face_y2 = x + w, y + h
 
-    if not (radius * 0.85 <= max(w, h) <= radius * 2.05):
+    # overlap with guide region
+    inter_x1 = max(x, x1)
+    inter_y1 = max(y, y1)
+    inter_x2 = min(face_x2, x2)
+    inter_y2 = min(face_y2, y2)
+    inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
+    area = w * h
+    overlap = (inter / area) if area else 0
+    if overlap < 0.7:
+        return None, "Align full face inside grid"
+
+    guide_w = x2 - x1
+    if not (guide_w * 0.45 <= w <= guide_w * 0.90):
         return None, "Move slightly closer/farther"
 
-    crop = gray[y : y + h, x : x + w]
+    crop = gray[y:face_y2, x:face_x2]
     blur = cv2.Laplacian(crop, cv2.CV_64F).var()
-    if blur < 65:
-        return None, "Hold still (frame too blurry)"
+    if blur < 60:
+        return None, "Hold still (blurry frame)"
 
     face = cv2.resize(crop, FACE_SIZE)
     face = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8)).apply(face)
     return face, "Good capture"
 
 
-def enroll_new_face_android_style(store: SecureFaceStore, name: str, camera_index: int, samples_count: int) -> None:
+def enroll_new_face_with_grid(store: SecureFaceStore, name: str, camera_index: int, samples_count: int) -> None:
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {camera_index}")
 
     saved = 0
     last_capture = 0.0
-    print("Android-style scan started. Follow prompts on screen.")
+    print("Face grid scan started. Follow prompts on screen.")
 
     try:
         while True:
@@ -385,15 +386,15 @@ def enroll_new_face_android_style(store: SecureFaceStore, name: str, camera_inde
                 print("[WARN] Could not read frame")
                 break
 
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             step_idx = min(saved, len(ENROLL_STEPS) - 1)
             step_text = f"Step {saved + 1}/{samples_count}: {ENROLL_STEPS[step_idx]}"
             progress = saved / max(samples_count, 1)
-            center, radius = _draw_scan_ui(frame, progress, step_text, "Position your face")
-            face, status = _extract_enroll_face(gray, center, radius)
+            guide_rect = _draw_face_grid(frame, progress, step_text, "Position your face in the grid")
 
-            # draw latest status again after extraction
-            cv2.putText(frame, status, (center[0] - 160, frame.shape[0] - 42), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (0, 210, 130), 2)
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            face, status = _extract_enroll_face(gray, guide_rect)
+            x1, y1, _, y2 = guide_rect
+            cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
 
             if face is not None and (time.time() - last_capture) > 0.6:
                 store.add_sample(name, face)
@@ -428,15 +429,15 @@ def parse_args() -> argparse.Namespace:
         "--threshold",
         type=float,
         default=-1,
-        help="LBPH threshold; set <=0 for auto calibration (recommended)",
+        help="LBPH threshold; <=0 enables auto-calibration (recommended)",
     )
     parser.add_argument("--cooldown", type=float, default=2.0)
-    parser.add_argument("--stable-frames", type=int, default=4)
+    parser.add_argument("--stable-frames", type=int, default=3)
     parser.add_argument("--secure-dir", type=Path, default=Path("secure_data"))
     parser.add_argument("--key-file", type=Path, default=None)
 
     sub = parser.add_subparsers(dest="command", required=False)
-    enroll = sub.add_parser("enroll", help="Android-style guided face enrollment")
+    enroll = sub.add_parser("enroll", help="Guided face enrollment with face grid")
     enroll.add_argument("--name", required=True)
     enroll.add_argument("--samples", type=int, default=12)
 
@@ -448,7 +449,7 @@ def main() -> None:
     store = SecureFaceStore(args.secure_dir, args.key_file)
 
     if args.command == "enroll":
-        enroll_new_face_android_style(store, args.name, args.camera_index, args.samples)
+        enroll_new_face_with_grid(store, args.name, args.camera_index, args.samples)
         return
 
     while True:
@@ -460,10 +461,11 @@ def main() -> None:
             stable_frames=args.stable_frames,
         )
         enroll_requested = app.run()
+
         if enroll_requested:
             person = input("Enter person name to enroll: ").strip()
             if person:
-                enroll_new_face_android_style(store, person, args.camera_index, samples_count=12)
+                enroll_new_face_with_grid(store, person, args.camera_index, samples_count=12)
             continue
         break
 
