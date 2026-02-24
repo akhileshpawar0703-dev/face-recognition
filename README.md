@@ -1,21 +1,19 @@
-# Secure Face Detection Lock/Unlock UI (Detection-Fixed)
+# Secure Face Detection Lock/Unlock UI (Android-Style)
 
-This update specifically targets your latest issue: **face not being detected reliably**.
+This update gives a **proper Android mobile-like face setup flow** while also improving detection reliability.
 
-## What changed for detection reliability
-- Added a new detector layer with selectable backend:
-  - `--detector auto` (default): tries **YuNet** first, then falls back to Haar
+## What changed
+- Added a detector backend selector:
+  - `--detector auto` (default): YuNet first, fallback to Haar
   - `--detector yunet`: force YuNet
   - `--detector haar`: force Haar
-- YuNet model auto-downloads once into `secure_data/models/`.
-- Enrollment now uses the same detector backend as runtime.
-- Enrollment grid checks were relaxed to avoid rejecting valid face captures.
-- Stable unlock default lowered to `--stable-frames 2` to avoid over-strict gating.
-
-## Face-grid enrollment (requested)
-- Ring is removed.
-- 3x3 face grid guide + progress bar.
-- Auto capture + manual capture (`s`).
+- Enrollment UI now uses an **Android-style oval guide** with:
+  - alignment ticks,
+  - outer progress arc,
+  - step-by-step prompts,
+  - auto capture + manual capture (`s`).
+- Enrollment and runtime use the same detector backend for consistency.
+- Recognition still uses encrypted face storage + adaptive threshold support.
 
 ## Install
 
@@ -25,23 +23,23 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Enroll
+## Enroll (Android-like)
 
 ```bash
 python app.py enroll --name "akhilesh" --samples 12 --detector auto
 ```
 
-## Run
+## Run unlock UI
 
 ```bash
 python app.py --camera-index 0 --threshold -1 --stable-frames 2 --detector auto
 ```
 
-## Tuning if still not detecting
-1. Try `--detector yunet` first.
-2. If network blocks model download, use `--detector haar`.
-3. Increase threshold manually: `--threshold 90` or `--threshold 110`.
-4. Ensure bright frontal lighting and re-enroll.
+## Tuning if still failing
+1. Try `--detector yunet`.
+2. If YuNet model download is blocked, use `--detector haar`.
+3. Try higher threshold values like `--threshold 95` or `--threshold 115`.
+4. Re-enroll in brighter frontal lighting.
 
 ## Secure data
 Stored in `secure_data/`:

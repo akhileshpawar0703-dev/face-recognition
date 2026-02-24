@@ -347,68 +347,68 @@ class FaceUnlockUI:
         return enroll_requested
 
 
-def _draw_face_grid(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[int, int, int, int]:
+def _draw_android_face_guide(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
+    """Android-like enrollment overlay with oval guide and progress."""
     h, w = frame.shape[:2]
-    grid_w = int(w * 0.45)
-    grid_h = int(h * 0.62)
-    x1 = (w - grid_w) // 2
-    y1 = (h - grid_h) // 2
-    x2 = x1 + grid_w
-    y2 = y1 + grid_h
+    center = (w // 2, h // 2)
+    axes = (int(w * 0.17), int(h * 0.30))
 
+    # dim outside for focus
     overlay = frame.copy()
-    cv2.rectangle(overlay, (x1, y1), (x2, y2), (30, 140, 80), -1)
-    cv2.addWeighted(overlay, 0.12, frame, 0.88, 0, frame)
+    cv2.rectangle(overlay, (0, 0), (w, h), (20, 20, 28), -1)
+    cv2.addWeighted(overlay, 0.20, frame, 0.80, 0, frame)
 
-    cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 220, 120), 2)
-    for i in (1, 2):
-        gx = x1 + (grid_w * i) // 3
-        gy = y1 + (grid_h * i) // 3
-        cv2.line(frame, (gx, y1), (gx, y2), (0, 190, 105), 1)
-        cv2.line(frame, (x1, gy), (x2, gy), (0, 190, 105), 1)
+    # oval face frame
+    cv2.ellipse(frame, center, axes, 0, 0, 360, (0, 215, 120), 2)
 
-    bar_y = y2 + 14
-    cv2.rectangle(frame, (x1, bar_y), (x2, bar_y + 12), (90, 90, 90), 1)
-    fill = int((x2 - x1 - 2) * max(0.0, min(1.0, progress)))
-    cv2.rectangle(frame, (x1 + 1, bar_y + 1), (x1 + 1 + fill, bar_y + 11), (0, 210, 120), -1)
+    # top/bottom/left/right alignment ticks
+    tick = 24
+    cv2.line(frame, (center[0] - tick, center[1] - axes[1]), (center[0] + tick, center[1] - axes[1]), (0, 215, 120), 2)
+    cv2.line(frame, (center[0] - tick, center[1] + axes[1]), (center[0] + tick, center[1] + axes[1]), (0, 215, 120), 2)
+    cv2.line(frame, (center[0] - axes[0], center[1] - tick), (center[0] - axes[0], center[1] + tick), (0, 215, 120), 2)
+    cv2.line(frame, (center[0] + axes[0], center[1] - tick), (center[0] + axes[0], center[1] + tick), (0, 215, 120), 2)
 
-    cv2.putText(frame, "Face Scan", (x1, y1 - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (240, 240, 240), 2)
-    cv2.putText(frame, step_text, (x1, y2 + 42), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (240, 240, 240), 2)
-    cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
-    cv2.putText(frame, "q cancel | s manual capture", (x1, y2 + 90), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1)
-    return x1, y1, x2, y2
+    # progress ring around oval
+    end_angle = int(360 * max(0.0, min(1.0, progress)))
+    cv2.ellipse(frame, center, (axes[0] + 24, axes[1] + 24), -90, 0, end_angle, (0, 230, 140), 5)
+
+    # header/footer text
+    cv2.putText(frame, "Android-style Face Setup", (24, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.88, (240, 240, 240), 2)
+    cv2.putText(frame, step_text, (24, h - 66), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (240, 240, 240), 2)
+    cv2.putText(frame, status, (24, h - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 130), 2)
+    cv2.putText(frame, "q cancel | s manual capture", (24, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1)
+
+    return center, axes
 
 
-def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide_rect: Tuple[int, int, int, int]) -> Tuple[Optional[np.ndarray], str]:
+def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide: Tuple[Tuple[int, int], Tuple[int, int]]) -> Tuple[Optional[np.ndarray], str]:
     gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
     faces = detector.detect(frame_bgr if detector.yunet is not None else gray)
     if not faces:
         return None, "No face detected"
 
-    # choose largest face to avoid strict single-face failure
+    # choose largest face
     x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-    x1, y1, x2, y2 = guide_rect
-    fx2, fy2 = x + w, y + h
+    cx, cy = x + w // 2, y + h // 2
+    center, axes = guide
 
-    inter_x1 = max(x, x1)
-    inter_y1 = max(y, y1)
-    inter_x2 = min(fx2, x2)
-    inter_y2 = min(fy2, y2)
-    inter = max(0, inter_x2 - inter_x1) * max(0, inter_y2 - inter_y1)
-    area = w * h
-    overlap = inter / area if area else 0
-    if overlap < 0.45:
-        return None, "Align face inside grid"
+    # check face center inside oval
+    nx = (cx - center[0]) / max(axes[0], 1)
+    ny = (cy - center[1]) / max(axes[1], 1)
+    if (nx * nx + ny * ny) > 0.72:
+        return None, "Center your face in the oval"
 
-    guide_w = x2 - x1
-    if not (guide_w * 0.35 <= w <= guide_w * 1.05):
+    # relative size constraints for typical webcam distance
+    target_w = axes[0] * 1.35
+    if not (target_w * 0.65 <= w <= target_w * 1.45):
         return None, "Move slightly closer/farther"
 
     crop = gray[max(0, y):max(0, y) + h, max(0, x):max(0, x) + w]
     if crop.size == 0:
         return None, "Face crop failed"
+
     blur = cv2.Laplacian(crop, cv2.CV_64F).var()
-    if blur < 40:
+    if blur < 35:
         return None, "Hold still (blurry frame)"
 
     face = cv2.resize(crop, FACE_SIZE)
@@ -416,7 +416,7 @@ def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide_re
     return face, "Good capture"
 
 
-def enroll_new_face_with_grid(
+def enroll_new_face_android_style(
     store: SecureFaceStore,
     name: str,
     camera_index: int,
@@ -430,7 +430,7 @@ def enroll_new_face_with_grid(
     detector = FaceDetector(store.model_dir, detector_mode=detector_mode)
     saved = 0
     last_capture = 0.0
-    print("Face grid scan started. Follow prompts on screen.")
+    print("Android-like face setup started. Follow prompts on screen.")
 
     try:
         while True:
@@ -442,13 +442,12 @@ def enroll_new_face_with_grid(
             step_idx = min(saved, len(ENROLL_STEPS) - 1)
             step_text = f"Step {saved + 1}/{samples_count}: {ENROLL_STEPS[step_idx]}"
             progress = saved / max(samples_count, 1)
-            guide_rect = _draw_face_grid(frame, progress, step_text, "Position your face in the grid")
+            guide = _draw_android_face_guide(frame, progress, step_text, "Align face with oval")
 
-            face, status = _extract_enroll_face(detector, frame, guide_rect)
-            x1, _, _, y2 = guide_rect
-            cv2.putText(frame, status, (x1, y2 + 66), cv2.FONT_HERSHEY_SIMPLEX, 0.56, (0, 210, 130), 2)
+            face, status = _extract_enroll_face(detector, frame, guide)
+            cv2.putText(frame, status, (24, frame.shape[0] - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 130), 2)
 
-            if face is not None and (time.time() - last_capture) > 0.5:
+            if face is not None and (time.time() - last_capture) > 0.45:
                 store.add_sample(name, face)
                 saved += 1
                 last_capture = time.time()
@@ -463,7 +462,7 @@ def enroll_new_face_with_grid(
                 store.add_sample(name, face)
                 saved += 1
                 print(f"Manual capture {saved}/{samples_count}")
-                time.sleep(0.15)
+                time.sleep(0.12)
 
             if saved >= samples_count:
                 store.append_audit_event(name.lower(), 0.0, True)
@@ -485,7 +484,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--key-file", type=Path, default=None)
 
     sub = parser.add_subparsers(dest="command", required=False)
-    enroll = sub.add_parser("enroll", help="Guided face enrollment with face grid")
+    enroll = sub.add_parser("enroll", help="Android-like guided face enrollment")
     enroll.add_argument("--name", required=True)
     enroll.add_argument("--samples", type=int, default=12)
 
@@ -497,7 +496,7 @@ def main() -> None:
     store = SecureFaceStore(args.secure_dir, args.key_file)
 
     if args.command == "enroll":
-        enroll_new_face_with_grid(store, args.name, args.camera_index, args.samples, detector_mode=args.detector)
+        enroll_new_face_android_style(store, args.name, args.camera_index, args.samples, detector_mode=args.detector)
         return
 
     while True:
@@ -513,7 +512,7 @@ def main() -> None:
         if enroll_requested:
             person = input("Enter person name to enroll: ").strip()
             if person:
-                enroll_new_face_with_grid(store, person, args.camera_index, samples_count=12, detector_mode=args.detector)
+                enroll_new_face_android_style(store, person, args.camera_index, samples_count=12, detector_mode=args.detector)
             continue
         break
 
