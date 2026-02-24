@@ -161,6 +161,7 @@ class FaceEngine:
 
         self._train(samples)
         self.threshold = threshold if threshold > 0 else self._calibrate_threshold()
+        self.soft_threshold = float(min(self.threshold + 45.0, 170.0))
 
     @staticmethod
     def _preprocess(face_gray: np.ndarray) -> np.ndarray:
@@ -235,6 +236,7 @@ class FaceUnlockUI:
         self.engine = FaceEngine(secure_store.load_samples(), threshold=confidence_threshold, detector=detector)
 
         self.history: Deque[str] = deque(maxlen=self.stable_frames)
+        self.score_history: Deque[float] = deque(maxlen=self.stable_frames)
         self.last_unlock_time = 0.0
         self.last_person: Optional[str] = None
         self.last_audit_at = 0.0
@@ -258,7 +260,7 @@ class FaceUnlockUI:
         cv2.putText(frame, f"Status: {state}", (14, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
         cv2.putText(frame, greeting, (295, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (248, 248, 248), 2)
 
-        metrics = f"thr={self.engine.threshold:.1f} best={best_score:.1f}"
+        metrics = f"thr={self.engine.threshold:.1f} soft={self.engine.soft_threshold:.1f} best={best_score:.1f}"
         cv2.putText(frame, metrics, (14, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
         cv2.putText(frame, "q/ESC quit | e enroll", (250, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
         cv2.putText(frame, f"Detected: {faces}", (frame.shape[1] - 150, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
@@ -283,13 +285,30 @@ class FaceUnlockUI:
 
                 for result in results:
                     top, right, bottom, left = result.location
+                    candidate_label = result.final_label
+                    soft_match = (
+                        result.final_label == "unknown"
+                        and result.predicted_label != "unknown"
+                        and result.confidence <= self.engine.soft_threshold
+                    )
+                    if soft_match:
+                        candidate_label = result.predicted_label
+
                     if result.confidence < best_score:
                         best_score = result.confidence
-                        best_label = result.final_label
+                        best_label = candidate_label
 
                     known = result.final_label != "unknown"
-                    shown = result.final_label if known else f"unknown ({result.predicted_label})"
-                    color = (0, 190, 0) if known else (0, 0, 230)
+                    if known:
+                        shown = result.final_label
+                        color = (0, 190, 0)
+                    elif soft_match:
+                        shown = f"maybe {result.predicted_label}"
+                        color = (0, 180, 255)
+                    else:
+                        shown = f"unknown ({result.predicted_label})"
+                        color = (0, 0, 230)
+
                     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
                     cv2.putText(
                         frame,
@@ -302,6 +321,7 @@ class FaceUnlockUI:
                     )
 
                 self.history.append(best_label)
+                self.score_history.append(best_score)
                 known_hist = [x for x in self.history if x != "unknown"]
 
                 unlocked = False
@@ -309,8 +329,13 @@ class FaceUnlockUI:
                 if len(known_hist) >= self.stable_frames:
                     label, votes = Counter(known_hist).most_common(1)[0]
                     if votes >= self.stable_frames:
-                        unlocked = True
-                        person = label
+                        scores_for_label = [
+                            sc for lb, sc in zip(self.history, self.score_history) if lb == label
+                        ]
+                        avg_score = float(np.mean(scores_for_label)) if scores_for_label else 999.0
+                        if avg_score <= self.engine.soft_threshold:
+                            unlocked = True
+                            person = label
 
                 if unlocked and person:
                     self.last_person = person

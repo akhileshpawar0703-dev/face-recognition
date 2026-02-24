@@ -1,6 +1,6 @@
 # Secure Face Detection Lock/Unlock UI (Android-Style)
 
-This update gives a **proper Android mobile-like face setup flow** while also improving detection reliability.
+This update gives a **proper Android mobile-like face setup flow** and adds a soft-unlock fallback for cases where face is correctly predicted but confidence is slightly high.
 
 ## What changed
 - Added a detector backend selector:
@@ -13,7 +13,7 @@ This update gives a **proper Android mobile-like face setup flow** while also im
   - step-by-step prompts,
   - auto capture + manual capture (`s`).
 - Enrollment and runtime use the same detector backend for consistency.
-- Recognition still uses encrypted face storage + adaptive threshold support.
+- Recognition now has two stages: strict threshold + soft-threshold temporal fallback to reduce "unknown (your_name)" lock situations.
 
 ## Install
 
@@ -40,7 +40,7 @@ python app.py --camera-index 0 --threshold -1 --stable-frames 2 --detector auto
 ## Tuning if still failing
 1. Try `--detector yunet`.
 2. If YuNet model download is blocked, use `--detector haar`.
-3. Try higher threshold values like `--threshold 95` or `--threshold 115`.
+3. If it still shows `unknown (your_name)` with high score, try `--threshold 95` or `--threshold 115`.
 4. Re-enroll in brighter frontal lighting.
 
 ## Secure data
