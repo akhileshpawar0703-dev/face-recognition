@@ -1,66 +1,56 @@
-# Secure Face Detection Lock/Unlock UI
+# Secure Face Detection Lock/Unlock UI (No dlib)
 
-This app provides a webcam-based lock/unlock UI with **person-specific face recognition** and **encrypted data storage**.
+This version uses **OpenCV only** for detection + recognition, so it avoids the `dlib` build failure you hit on Windows.
 
-## What is implemented
-- Real-time face detection using OpenCV + `face_recognition`.
-- Unlock only when the detected face matches an enrolled authorized person.
-- Person-specific welcome text after successful unlock.
-- **Enroll mode** to add a new face from webcam.
-- Encrypted storage for:
-  - known face encodings (`secure_data/known_faces.enc`)
-  - detection audit log (`secure_data/recognition_audit.log.enc`)
-- Encryption key file created with restricted permissions (`chmod 600`).
+## Why this fixes your error
+Your error came from `face-recognition -> dlib`, which needs a C++ toolchain/Visual Studio build setup on Windows.  
+This project now uses:
+- Haar Cascade for face detection
+- LBPH recognizer (`cv2.face`) for person recognition
+
+No `face-recognition` and no `dlib` dependency.
+
+## Features
+- Lock/Unlock UI from webcam.
+- Unlock only for enrolled people.
+- Personalized welcome messages per person.
+- `enroll` command to add new people from webcam.
+- Secure encrypted storage for:
+  - enrolled face samples (`secure_data/face_samples.enc`)
+  - recognition audit (`secure_data/recognition_audit.log.enc`)
+- Encryption key generated automatically with restricted permission (`chmod 600` where supported).
 
 ## Install
 
 ```bash
 python -m venv .venv
-source .venv/bin/activate
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-## Enroll a new face (required first)
+## Enroll a person first
 
 ```bash
-python app.py enroll --name "alice"
+python app.py enroll --name "alice" --samples 8
 ```
 
-During enrollment:
-- keep exactly one face visible.
-- press `s` to save that face.
-- press `q` to cancel.
+- Keep exactly one face in frame.
+- Press `s` to capture each sample.
+- Press `q` to cancel.
 
-## Run lock/unlock UI
+## Run UI
 
 ```bash
-python app.py --camera-index 0 --threshold 0.45 --cooldown 2.0
+python app.py --camera-index 0 --threshold 55 --cooldown 2.0
 ```
 
-Press `q` or `ESC` to quit.
-
-## Optional config
-
-```bash
-python app.py \
-  --secure-dir secure_data \
-  --key-file secure_data/face_store.key \
-  --camera-index 0
-```
+- LBPH threshold: lower is stricter (typical range `40-70`).
+- Press `q` or `ESC` to quit.
 
 ## Personalized greetings
 
-Edit `WELCOME_MESSAGES` in `app.py`:
+Edit `WELCOME_MESSAGES` in `app.py`.
 
-```python
-WELCOME_MESSAGES = {
-    "alice": "Welcome back, Alice 👋",
-    "bob": "Hi Bob, access granted ✅",
-}
-```
-
-Anyone not listed receives:
-
-```text
-Welcome, <Name>!
-```
+## Notes
+- `opencv-contrib-python` is required because LBPH is under `cv2.face`.
+- If camera index `0` does not work, try `1` or `2`.
