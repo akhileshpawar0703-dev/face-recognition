@@ -487,6 +487,12 @@ def parse_args() -> argparse.Namespace:
     enroll = sub.add_parser("enroll", help="Android-like guided face enrollment")
     enroll.add_argument("--name", required=True)
     enroll.add_argument("--samples", type=int, default=12)
+    enroll.add_argument(
+        "--detector",
+        choices=["auto", "yunet", "haar"],
+        default=None,
+        help="Enrollment detector backend (overrides top-level --detector if provided)",
+    )
 
     return parser.parse_args()
 
@@ -496,7 +502,8 @@ def main() -> None:
     store = SecureFaceStore(args.secure_dir, args.key_file)
 
     if args.command == "enroll":
-        enroll_new_face_android_style(store, args.name, args.camera_index, args.samples, detector_mode=args.detector)
+        enroll_detector = args.detector if args.detector is not None else "auto"
+        enroll_new_face_android_style(store, args.name, args.camera_index, args.samples, detector_mode=enroll_detector)
         return
 
     while True:

@@ -26,7 +26,9 @@ pip install -r requirements.txt
 ## Enroll (Android-like)
 
 ```bash
-python app.py enroll --name "akhilesh" --samples 12 --detector auto
+python app.py --detector auto enroll --name "akhilesh" --samples 12
+# also supported:
+# python app.py enroll --name "akhilesh" --samples 12 --detector auto
 ```
 
 ## Run unlock UI
