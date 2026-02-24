@@ -1,4 +1,6 @@
 import argparse
+import base64
+import hashlib
 import json
 import os
 import pickle
@@ -6,13 +8,13 @@ import time
 import urllib.request
 from collections import Counter, deque
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Deque, Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from cryptography.fernet import Fernet
+from cryptography.fernet import Fernet, InvalidToken
 
 WELCOME_MESSAGES: Dict[str, str] = {
     "alice": "Welcome back, Alice 👋",
@@ -44,7 +46,9 @@ class MatchResult:
 
 
 class SecureFaceStore:
-    def __init__(self, secure_dir: Path, key_file: Optional[Path] = None) -> None:
+    """Encrypted storage with minimization + tamper-evident audit chain."""
+
+    def __init__(self, secure_dir: Path, key_file: Optional[Path] = None, max_samples_per_person: int = 20) -> None:
         self.secure_dir = secure_dir
         self.secure_dir.mkdir(parents=True, exist_ok=True)
         self.model_dir = self.secure_dir / "models"
@@ -52,6 +56,8 @@ class SecureFaceStore:
         self.key_file = key_file or (self.secure_dir / "face_store.key")
         self.samples_file = self.secure_dir / "face_samples.enc"
         self.audit_file = self.secure_dir / "recognition_audit.log.enc"
+        self.audit_state_file = self.secure_dir / "audit_chain.state"
+        self.max_samples_per_person = max_samples_per_person
         self.cipher = Fernet(self._load_or_create_key())
 
     def _load_or_create_key(self) -> bytes:
@@ -61,6 +67,15 @@ class SecureFaceStore:
         self.key_file.write_bytes(key)
         os.chmod(self.key_file, 0o600)
         return key
+
+    def _read_audit_chain_state(self) -> str:
+        if not self.audit_state_file.exists():
+            return "GENESIS"
+        return self.audit_state_file.read_text(encoding="utf-8").strip() or "GENESIS"
+
+    def _write_audit_chain_state(self, chain_hash: str) -> None:
+        self.audit_state_file.write_text(chain_hash, encoding="utf-8")
+        os.chmod(self.audit_state_file, 0o600)
 
     def load_samples(self) -> Dict[str, List[np.ndarray]]:
         if not self.samples_file.exists():
@@ -73,9 +88,14 @@ class SecureFaceStore:
         }
 
     def save_samples(self, samples: Dict[str, List[np.ndarray]]) -> None:
+        # Privacy/minimization: cap stored samples per person.
+        minimized: Dict[str, List[np.ndarray]] = {}
+        for name, sample_list in samples.items():
+            minimized[name] = sample_list[-self.max_samples_per_person :]
+
         serializable = {
             name: [sample.tolist() for sample in sample_list]
-            for name, sample_list in samples.items()
+            for name, sample_list in minimized.items()
         }
         self.samples_file.write_bytes(self.cipher.encrypt(pickle.dumps(serializable)))
         os.chmod(self.samples_file, 0o600)
@@ -86,22 +106,110 @@ class SecureFaceStore:
         samples.setdefault(normalized, []).append(face_image)
         self.save_samples(samples)
 
-    def append_audit_event(self, label: str, confidence: float, unlocked: bool) -> None:
-        event = {
-            "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+    def delete_person(self, name: str) -> bool:
+        normalized = name.strip().lower()
+        samples = self.load_samples()
+        if normalized not in samples:
+            return False
+        del samples[normalized]
+        self.save_samples(samples)
+        self.append_audit_event(label=normalized, confidence=0.0, unlocked=False, event_type="delete_identity")
+        return True
+
+    def append_audit_event(self, label: str, confidence: float, unlocked: bool, event_type: str = "recognition") -> None:
+        ts = datetime.now(timezone.utc).isoformat()
+        core = {
+            "timestamp_utc": ts,
+            "event_type": event_type,
             "label": label,
             "confidence": round(float(confidence), 3),
             "unlocked": unlocked,
         }
-        enc = self.cipher.encrypt(json.dumps(event).encode("utf-8"))
+        prev_hash = self._read_audit_chain_state()
+        payload_for_hash = json.dumps(core, sort_keys=True) + "|" + prev_hash
+        chain_hash = hashlib.sha256(payload_for_hash.encode("utf-8")).hexdigest()
+        record = {**core, "prev_hash": prev_hash, "chain_hash": chain_hash}
+
+        enc = self.cipher.encrypt(json.dumps(record).encode("utf-8"))
         with self.audit_file.open("ab") as f:
             f.write(enc + b"\n")
         os.chmod(self.audit_file, 0o600)
+        self._write_audit_chain_state(chain_hash)
+
+    def verify_audit_chain(self) -> bool:
+        if not self.audit_file.exists():
+            return True
+        prev_hash = "GENESIS"
+        for line in self.audit_file.read_bytes().splitlines():
+            if not line:
+                continue
+            try:
+                rec = json.loads(self.cipher.decrypt(line).decode("utf-8"))
+            except (InvalidToken, json.JSONDecodeError):
+                return False
+            expected = hashlib.sha256(
+                (json.dumps(
+                    {
+                        "timestamp_utc": rec.get("timestamp_utc"),
+                        "event_type": rec.get("event_type", "recognition"),
+                        "label": rec.get("label"),
+                        "confidence": rec.get("confidence"),
+                        "unlocked": rec.get("unlocked"),
+                    },
+                    sort_keys=True,
+                )
+                + "|"
+                + prev_hash).encode("utf-8")
+            ).hexdigest()
+            if rec.get("prev_hash") != prev_hash or rec.get("chain_hash") != expected:
+                return False
+            prev_hash = rec["chain_hash"]
+        return True
+
+    def prune_audit_older_than(self, days: int) -> int:
+        if days <= 0 or not self.audit_file.exists():
+            return 0
+
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        kept: List[bytes] = []
+        removed = 0
+        prev_hash = "GENESIS"
+
+        for line in self.audit_file.read_bytes().splitlines():
+            if not line:
+                continue
+            try:
+                rec = json.loads(self.cipher.decrypt(line).decode("utf-8"))
+            except Exception:
+                continue
+
+            ts = datetime.fromisoformat(rec["timestamp_utc"].replace("Z", "+00:00"))
+            if ts >= cutoff:
+                core = {
+                    "timestamp_utc": rec["timestamp_utc"],
+                    "event_type": rec.get("event_type", "recognition"),
+                    "label": rec["label"],
+                    "confidence": rec["confidence"],
+                    "unlocked": rec["unlocked"],
+                }
+                payload = json.dumps(core, sort_keys=True) + "|" + prev_hash
+                chain_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+                new_rec = {**core, "prev_hash": prev_hash, "chain_hash": chain_hash}
+                kept.append(self.cipher.encrypt(json.dumps(new_rec).encode("utf-8")))
+                prev_hash = chain_hash
+            else:
+                removed += 1
+
+        with self.audit_file.open("wb") as f:
+            for enc in kept:
+                f.write(enc + b"\n")
+        os.chmod(self.audit_file, 0o600)
+        self._write_audit_chain_state(prev_hash)
+        return removed
 
 
 class FaceDetector:
     def __init__(self, model_dir: Path, detector_mode: str = "auto") -> None:
-        self.detector_mode = detector_mode
         self.yunet = None
         self.haar = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
         if detector_mode in ("auto", "yunet"):
@@ -114,14 +222,7 @@ class FaceDetector:
             model_path = model_dir / "face_detection_yunet_2023mar.onnx"
             if not model_path.exists():
                 urllib.request.urlretrieve(YUNET_URL, model_path)
-            detector = cv2.FaceDetectorYN_create(
-                str(model_path),
-                "",
-                (320, 320),
-                score_threshold=0.7,
-                nms_threshold=0.3,
-                top_k=5000,
-            )
+            detector = cv2.FaceDetectorYN_create(str(model_path), "", (320, 320), score_threshold=0.7, nms_threshold=0.3, top_k=5000)
             print("[INFO] Detection backend: YuNet")
             return detector
         except Exception:
@@ -131,14 +232,12 @@ class FaceDetector:
     def detect(self, frame: np.ndarray) -> List[Tuple[int, int, int, int]]:
         h, w = frame.shape[:2]
         boxes: List[Tuple[int, int, int, int]] = []
-
         if self.yunet is not None:
             self.yunet.setInputSize((w, h))
             _, faces = self.yunet.detect(frame)
             if faces is not None:
                 for row in faces:
-                    x, y, bw, bh = row[:4]
-                    x, y, bw, bh = int(x), int(y), int(bw), int(bh)
+                    x, y, bw, bh = map(int, row[:4])
                     if bw > 20 and bh > 20:
                         boxes.append((x, y, bw, bh))
                 return boxes
@@ -154,11 +253,9 @@ class FaceEngine:
     def __init__(self, samples: Dict[str, List[np.ndarray]], threshold: float, detector: FaceDetector) -> None:
         if not hasattr(cv2, "face"):
             raise RuntimeError("OpenCV face module missing. Install opencv-contrib-python.")
-
         self.detector = detector
         self.recognizer = cv2.face.LBPHFaceRecognizer_create(radius=2, neighbors=16, grid_x=8, grid_y=8)
         self.id_to_name: Dict[int, str] = {}
-
         self._train(samples)
         self.threshold = threshold if threshold > 0 else self._calibrate_threshold()
         self.soft_threshold = float(min(self.threshold + 45.0, 170.0))
@@ -170,17 +267,14 @@ class FaceEngine:
         return cv2.GaussianBlur(face, (3, 3), 0)
 
     def _train(self, samples: Dict[str, List[np.ndarray]]) -> None:
-        faces: List[np.ndarray] = []
-        labels: List[int] = []
+        faces, labels = [], []
         for idx, (name, sample_list) in enumerate(sorted(samples.items())):
             self.id_to_name[idx] = name
             for sample in sample_list:
                 faces.append(self._preprocess(sample))
                 labels.append(idx)
-
         if not faces:
             raise RuntimeError("No enrolled faces found. Run: python app.py enroll --name <person>")
-
         self.recognizer.train(faces, np.array(labels, dtype=np.int32))
         self.training_faces = faces
 
@@ -198,36 +292,23 @@ class FaceEngine:
     def recognize(self, frame_bgr: np.ndarray) -> List[MatchResult]:
         gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
         boxes = self.detect_faces(frame_bgr)
-        results: List[MatchResult] = []
-
+        out: List[MatchResult] = []
         for x, y, w, h in boxes:
-            x = max(0, x)
-            y = max(0, y)
-            w = min(w, gray.shape[1] - x)
-            h = min(h, gray.shape[0] - y)
+            x, y = max(0, x), max(0, y)
+            w, h = min(w, gray.shape[1] - x), min(h, gray.shape[0] - y)
             if w <= 0 or h <= 0:
                 continue
-
             crop = gray[y : y + h, x : x + w]
             processed = self._preprocess(crop)
             label_id, confidence = self.recognizer.predict(processed)
             predicted = self.id_to_name.get(label_id, "unknown")
             final = predicted if confidence <= self.threshold else "unknown"
-            results.append(MatchResult((y, x + w, y + h, x), predicted, final, float(confidence)))
-
-        return results
+            out.append(MatchResult((y, x + w, y + h, x), predicted, final, float(confidence)))
+        return out
 
 
 class FaceUnlockUI:
-    def __init__(
-        self,
-        secure_store: SecureFaceStore,
-        camera_index: int,
-        confidence_threshold: float,
-        cooldown_seconds: float,
-        stable_frames: int,
-        detector_mode: str,
-    ) -> None:
+    def __init__(self, secure_store: SecureFaceStore, camera_index: int, confidence_threshold: float, cooldown_seconds: float, stable_frames: int, detector_mode: str) -> None:
         self.secure_store = secure_store
         self.camera_index = camera_index
         self.cooldown_seconds = cooldown_seconds
@@ -240,6 +321,10 @@ class FaceUnlockUI:
         self.last_unlock_time = 0.0
         self.last_person: Optional[str] = None
         self.last_audit_at = 0.0
+
+        # Runtime safety: rate-limit repeated failures with temporary lockouts.
+        self.fail_streak = 0
+        self.locked_until = 0.0
 
     @staticmethod
     def _personalized(name: str) -> str:
@@ -255,11 +340,9 @@ class FaceUnlockUI:
         color = (0, 200, 0) if state == "UNLOCKED" else (0, 0, 230)
         self._panel(frame, 0, 82)
         self._panel(frame, frame.shape[0] - 56, frame.shape[0])
-
         cv2.putText(frame, "Secure Face Unlock", (14, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.78, (236, 236, 236), 2)
         cv2.putText(frame, f"Status: {state}", (14, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.72, color, 2)
         cv2.putText(frame, greeting, (295, 66), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (248, 248, 248), 2)
-
         metrics = f"thr={self.engine.threshold:.1f} soft={self.engine.soft_threshold:.1f} best={best_score:.1f}"
         cv2.putText(frame, metrics, (14, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
         cv2.putText(frame, "q/ESC quit | e enroll", (250, frame.shape[0] - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.54, (225, 225, 225), 1)
@@ -280,8 +363,7 @@ class FaceUnlockUI:
 
                 results = self.engine.recognize(frame)
                 now = time.time()
-                best_score = 999.0
-                best_label = "unknown"
+                best_score, best_label = 999.0, "unknown"
 
                 for result in results:
                     top, right, bottom, left = result.location
@@ -298,59 +380,47 @@ class FaceUnlockUI:
                         best_score = result.confidence
                         best_label = candidate_label
 
-                    known = result.final_label != "unknown"
-                    if known:
-                        shown = result.final_label
-                        color = (0, 190, 0)
+                    if result.final_label != "unknown":
+                        shown, color = result.final_label, (0, 190, 0)
                     elif soft_match:
-                        shown = f"maybe {result.predicted_label}"
-                        color = (0, 180, 255)
+                        shown, color = f"maybe {result.predicted_label}", (0, 180, 255)
                     else:
-                        shown = f"unknown ({result.predicted_label})"
-                        color = (0, 0, 230)
+                        shown, color = f"unknown ({result.predicted_label})", (0, 0, 230)
 
                     cv2.rectangle(frame, (left, top), (right, bottom), color, 2)
-                    cv2.putText(
-                        frame,
-                        f"{shown} | score {result.confidence:.1f}",
-                        (left, max(16, top - 8)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.54,
-                        color,
-                        2,
-                    )
+                    cv2.putText(frame, f"{shown} | score {result.confidence:.1f}", (left, max(16, top - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.54, color, 2)
 
                 self.history.append(best_label)
                 self.score_history.append(best_score)
                 known_hist = [x for x in self.history if x != "unknown"]
 
-                unlocked = False
-                person = None
+                unlocked, person = False, None
                 if len(known_hist) >= self.stable_frames:
                     label, votes = Counter(known_hist).most_common(1)[0]
                     if votes >= self.stable_frames:
-                        scores_for_label = [
-                            sc for lb, sc in zip(self.history, self.score_history) if lb == label
-                        ]
+                        scores_for_label = [sc for lb, sc in zip(self.history, self.score_history) if lb == label]
                         avg_score = float(np.mean(scores_for_label)) if scores_for_label else 999.0
                         if avg_score <= self.engine.soft_threshold:
-                            unlocked = True
-                            person = label
+                            unlocked, person = True, label
 
-                if unlocked and person:
+                if now < self.locked_until:
+                    state = "LOCKED"
+                    secs = int(self.locked_until - now)
+                    greeting = f"Temporarily locked ({secs}s) after repeated failures"
+                    audit_label = "unknown"
+                elif unlocked and person:
+                    self.fail_streak = 0
                     self.last_person = person
                     self.last_unlock_time = now
-                    state = "UNLOCKED"
-                    greeting = self._personalized(person)
-                    audit_label = person
+                    state, greeting, audit_label = "UNLOCKED", self._personalized(person), person
                 elif (now - self.last_unlock_time) < self.cooldown_seconds and self.last_person:
-                    state = "UNLOCKED"
-                    greeting = self._personalized(self.last_person)
-                    audit_label = self.last_person
+                    state, greeting, audit_label = "UNLOCKED", self._personalized(self.last_person), self.last_person
                 else:
-                    state = "LOCKED"
-                    greeting = "Locked: align your face inside camera frame"
-                    audit_label = "unknown"
+                    self.fail_streak += 1
+                    if self.fail_streak in (10, 20, 30):
+                        backoff = min(60, 5 * (2 ** (self.fail_streak // 10 - 1)))
+                        self.locked_until = now + backoff
+                    state, greeting, audit_label = "LOCKED", "Locked: align your face inside camera frame", "unknown"
 
                 self._draw_ui(frame, state, greeting, len(results), best_score)
 
@@ -373,36 +443,23 @@ class FaceUnlockUI:
 
 
 def _draw_android_face_guide(frame: np.ndarray, progress: float, step_text: str, status: str) -> Tuple[Tuple[int, int], Tuple[int, int]]:
-    """Android-like enrollment overlay with oval guide and progress."""
     h, w = frame.shape[:2]
-    center = (w // 2, h // 2)
-    axes = (int(w * 0.17), int(h * 0.30))
-
-    # dim outside for focus
+    center, axes = (w // 2, h // 2), (int(w * 0.17), int(h * 0.30))
     overlay = frame.copy()
     cv2.rectangle(overlay, (0, 0), (w, h), (20, 20, 28), -1)
     cv2.addWeighted(overlay, 0.20, frame, 0.80, 0, frame)
-
-    # oval face frame
     cv2.ellipse(frame, center, axes, 0, 0, 360, (0, 215, 120), 2)
-
-    # top/bottom/left/right alignment ticks
     tick = 24
     cv2.line(frame, (center[0] - tick, center[1] - axes[1]), (center[0] + tick, center[1] - axes[1]), (0, 215, 120), 2)
     cv2.line(frame, (center[0] - tick, center[1] + axes[1]), (center[0] + tick, center[1] + axes[1]), (0, 215, 120), 2)
     cv2.line(frame, (center[0] - axes[0], center[1] - tick), (center[0] - axes[0], center[1] + tick), (0, 215, 120), 2)
     cv2.line(frame, (center[0] + axes[0], center[1] - tick), (center[0] + axes[0], center[1] + tick), (0, 215, 120), 2)
-
-    # progress ring around oval
     end_angle = int(360 * max(0.0, min(1.0, progress)))
     cv2.ellipse(frame, center, (axes[0] + 24, axes[1] + 24), -90, 0, end_angle, (0, 230, 140), 5)
-
-    # header/footer text
     cv2.putText(frame, "Android-style Face Setup", (24, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.88, (240, 240, 240), 2)
     cv2.putText(frame, step_text, (24, h - 66), cv2.FONT_HERSHEY_SIMPLEX, 0.60, (240, 240, 240), 2)
     cv2.putText(frame, status, (24, h - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 130), 2)
     cv2.putText(frame, "q cancel | s manual capture", (24, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.52, (210, 210, 210), 1)
-
     return center, axes
 
 
@@ -412,23 +469,18 @@ def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide: T
     if not faces:
         return None, "No face detected"
 
-    # choose largest face
     x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
     cx, cy = x + w // 2, y + h // 2
     center, axes = guide
-
-    # check face center inside oval
-    nx = (cx - center[0]) / max(axes[0], 1)
-    ny = (cy - center[1]) / max(axes[1], 1)
+    nx, ny = (cx - center[0]) / max(axes[0], 1), (cy - center[1]) / max(axes[1], 1)
     if (nx * nx + ny * ny) > 0.72:
         return None, "Center your face in the oval"
 
-    # relative size constraints for typical webcam distance
     target_w = axes[0] * 1.35
     if not (target_w * 0.65 <= w <= target_w * 1.45):
         return None, "Move slightly closer/farther"
 
-    crop = gray[max(0, y):max(0, y) + h, max(0, x):max(0, x) + w]
+    crop = gray[max(0, y) : max(0, y) + h, max(0, x) : max(0, x) + w]
     if crop.size == 0:
         return None, "Face crop failed"
 
@@ -441,13 +493,7 @@ def _extract_enroll_face(detector: FaceDetector, frame_bgr: np.ndarray, guide: T
     return face, "Good capture"
 
 
-def enroll_new_face_android_style(
-    store: SecureFaceStore,
-    name: str,
-    camera_index: int,
-    samples_count: int,
-    detector_mode: str,
-) -> None:
+def enroll_new_face_android_style(store: SecureFaceStore, name: str, camera_index: int, samples_count: int, detector_mode: str) -> None:
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
         raise RuntimeError(f"Cannot open camera index {camera_index}")
@@ -463,12 +509,10 @@ def enroll_new_face_android_style(
             if not ok:
                 print("[WARN] Could not read frame")
                 break
-
             step_idx = min(saved, len(ENROLL_STEPS) - 1)
             step_text = f"Step {saved + 1}/{samples_count}: {ENROLL_STEPS[step_idx]}"
             progress = saved / max(samples_count, 1)
             guide = _draw_android_face_guide(frame, progress, step_text, "Align face with oval")
-
             face, status = _extract_enroll_face(detector, frame, guide)
             cv2.putText(frame, status, (24, frame.shape[0] - 38), cv2.FONT_HERSHEY_SIMPLEX, 0.58, (0, 220, 130), 2)
 
@@ -490,7 +534,7 @@ def enroll_new_face_android_style(
                 time.sleep(0.12)
 
             if saved >= samples_count:
-                store.append_audit_event(name.lower(), 0.0, True)
+                store.append_audit_event(name.lower(), 0.0, True, event_type="enrollment")
                 print(f"Enrolled '{name}' with {samples_count} guided samples.")
                 break
     finally:
@@ -507,24 +551,41 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--detector", choices=["auto", "yunet", "haar"], default="auto")
     parser.add_argument("--secure-dir", type=Path, default=Path("secure_data"))
     parser.add_argument("--key-file", type=Path, default=None)
+    parser.add_argument("--max-samples-per-person", type=int, default=20)
+    parser.add_argument("--audit-retention-days", type=int, default=30)
 
     sub = parser.add_subparsers(dest="command", required=False)
     enroll = sub.add_parser("enroll", help="Android-like guided face enrollment")
     enroll.add_argument("--name", required=True)
     enroll.add_argument("--samples", type=int, default=12)
-    enroll.add_argument(
-        "--detector",
-        choices=["auto", "yunet", "haar"],
-        default=None,
-        help="Enrollment detector backend (overrides top-level --detector if provided)",
-    )
+    enroll.add_argument("--detector", choices=["auto", "yunet", "haar"], default=None)
+
+    delete = sub.add_parser("delete", help="Delete an enrolled identity (privacy right-to-delete)")
+    delete.add_argument("--name", required=True)
+
+    sub.add_parser("verify-audit", help="Verify tamper-evident audit chain")
 
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    store = SecureFaceStore(args.secure_dir, args.key_file)
+    store = SecureFaceStore(args.secure_dir, args.key_file, max_samples_per_person=args.max_samples_per_person)
+
+    # privacy minimization: prune old audit records on startup
+    pruned = store.prune_audit_older_than(args.audit_retention_days)
+    if pruned:
+        print(f"[INFO] Pruned {pruned} old audit events")
+
+    if args.command == "verify-audit":
+        ok = store.verify_audit_chain()
+        print("Audit chain OK" if ok else "Audit chain FAILED")
+        return
+
+    if args.command == "delete":
+        deleted = store.delete_person(args.name)
+        print(f"Deleted: {args.name}" if deleted else f"Identity not found: {args.name}")
+        return
 
     if args.command == "enroll":
         enroll_detector = args.detector if args.detector is not None else "auto"
