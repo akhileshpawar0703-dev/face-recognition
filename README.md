@@ -60,6 +60,21 @@ source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
+## Simple Desktop UI (new)
+
+If you prefer not to type commands, run:
+
+```bash
+python ui.py
+```
+
+This opens a Tkinter-based control panel for:
+- starting lock/unlock camera UI,
+- enrolling users,
+- encrypting/unlocking PDFs,
+- deleting identities,
+- verifying audit chain.
+
 ## Enroll (Android-like)
 
 ```bash
