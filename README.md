@@ -1,6 +1,6 @@
 # Secure Face Detection Lock/Unlock UI (Android-Style)
 
-This build includes Android-style enrollment, stronger unlock logic, **privacy minimization**, and **tamper/runtime safety** enhancements.
+This build includes Android-style enrollment, stronger unlock logic, **privacy minimization**, **tamper/runtime safety**, and **face-protected PDF unlocking**.
 
 ## New security/privacy additions
 
@@ -20,6 +20,30 @@ This build includes Android-style enrollment, stronger unlock logic, **privacy m
   python app.py verify-audit
   ```
 - Runtime lockout/backoff after repeated failures (temporary lock window).
+
+## Face-locked PDF feature (new)
+
+You can encrypt a PDF and require face authentication to unlock/open it.
+
+### 1) Encrypt PDF (bind to enrolled owner)
+
+```bash
+python app.py encrypt-pdf --pdf "C:/docs/secret.pdf" --owner "akhilesh" --out "C:/docs/secret.facepdf"
+```
+
+### 2) Unlock PDF with face (camera auto-triggers)
+
+```bash
+python app.py unlock-pdf --file "C:/docs/secret.facepdf" --timeout 25
+```
+
+- This command opens the camera, performs face authentication, decrypts the PDF, and opens it with the **default OS PDF handler** (Chrome or any reader depending on your system).
+- Optional:
+  ```bash
+  python app.py unlock-pdf --file "C:/docs/secret.facepdf" --out "C:/docs/decrypted_secret.pdf"
+  ```
+
+> Note: Directly intercepting *any random* double-click/open in third-party PDF readers is OS-level integration. This app provides a secure launcher flow (`unlock-pdf`) that triggers camera automatically before opening.
 
 ## Detection backend
 - `--detector auto` (default): YuNet first, fallback to Haar
@@ -68,4 +92,5 @@ Stored in `secure_data/`:
 - `face_samples.enc`
 - `recognition_audit.log.enc`
 - `audit_chain.state`
+- `file_registry.enc`
 - `models/face_detection_yunet_2023mar.onnx` (if YuNet used)

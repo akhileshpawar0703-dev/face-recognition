@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import pickle
+import tempfile
 import time
 import urllib.request
+import webbrowser
 from collections import Counter, deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -57,6 +59,7 @@ class SecureFaceStore:
         self.samples_file = self.secure_dir / "face_samples.enc"
         self.audit_file = self.secure_dir / "recognition_audit.log.enc"
         self.audit_state_file = self.secure_dir / "audit_chain.state"
+        self.file_registry_file = self.secure_dir / "file_registry.enc"
         self.max_samples_per_person = max_samples_per_person
         self.cipher = Fernet(self._load_or_create_key())
 
@@ -206,6 +209,158 @@ class SecureFaceStore:
         os.chmod(self.audit_file, 0o600)
         self._write_audit_chain_state(prev_hash)
         return removed
+
+    def _load_file_registry(self) -> Dict[str, Dict[str, str]]:
+        if not self.file_registry_file.exists():
+            return {}
+        payload = self.cipher.decrypt(self.file_registry_file.read_bytes())
+        data = json.loads(payload.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+
+    def _save_file_registry(self, registry: Dict[str, Dict[str, str]]) -> None:
+        payload = json.dumps(registry).encode("utf-8")
+        self.file_registry_file.write_bytes(self.cipher.encrypt(payload))
+        os.chmod(self.file_registry_file, 0o600)
+
+    def register_encrypted_pdf(self, encrypted_path: Path, owner: str, file_key: bytes, original_name: str) -> None:
+        registry = self._load_file_registry()
+        registry[str(encrypted_path.resolve())] = {
+            "owner": owner.strip().lower(),
+            "key_b64": base64.urlsafe_b64encode(file_key).decode("utf-8"),
+            "original_name": original_name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        self._save_file_registry(registry)
+
+    def get_encrypted_pdf_record(self, encrypted_path: Path) -> Optional[Dict[str, str]]:
+        registry = self._load_file_registry()
+        return registry.get(str(encrypted_path.resolve()))
+
+
+def encrypt_pdf_with_face(store: SecureFaceStore, pdf_path: Path, output_path: Optional[Path], owner: str) -> Path:
+    if not pdf_path.exists() or pdf_path.suffix.lower() != ".pdf":
+        raise ValueError(f"PDF not found or invalid extension: {pdf_path}")
+
+    samples = store.load_samples()
+    owner_norm = owner.strip().lower()
+    if owner_norm not in samples:
+        raise ValueError(f"Owner '{owner}' is not enrolled. Enroll first.")
+
+    out = output_path or pdf_path.with_suffix(".facepdf")
+    raw_pdf = pdf_path.read_bytes()
+    file_key = Fernet.generate_key()
+    encrypted_pdf = Fernet(file_key).encrypt(raw_pdf)
+    out.write_bytes(encrypted_pdf)
+
+    store.register_encrypted_pdf(out, owner=owner_norm, file_key=file_key, original_name=pdf_path.name)
+    store.append_audit_event(label=owner_norm, confidence=0.0, unlocked=False, event_type="encrypt_pdf")
+    return out
+
+
+def authenticate_face_once(
+    store: SecureFaceStore,
+    camera_index: int,
+    threshold: float,
+    detector_mode: str,
+    timeout_seconds: int,
+) -> Optional[str]:
+    detector = FaceDetector(store.model_dir, detector_mode=detector_mode)
+    engine = FaceEngine(store.load_samples(), threshold=threshold, detector=detector)
+
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        raise RuntimeError(f"Cannot open camera index {camera_index}")
+
+    history: Deque[str] = deque(maxlen=3)
+    deadline = time.time() + timeout_seconds
+    try:
+        while time.time() < deadline:
+            ok, frame = cap.read()
+            if not ok:
+                continue
+
+            results = engine.recognize(frame)
+            best = "unknown"
+            best_score = 999.0
+            for result in results:
+                t, r, b, l = result.location
+                candidate = result.final_label
+                if result.final_label == "unknown" and result.predicted_label != "unknown" and result.confidence <= engine.soft_threshold:
+                    candidate = result.predicted_label
+
+                if result.confidence < best_score:
+                    best_score, best = result.confidence, candidate
+
+                color = (0, 190, 0) if candidate != "unknown" else (0, 0, 230)
+                cv2.rectangle(frame, (l, t), (r, b), color, 2)
+                cv2.putText(frame, f"{candidate} | {result.confidence:.1f}", (l, max(16, t - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
+
+            history.append(best)
+            known = [x for x in history if x != "unknown"]
+            if len(known) >= 2:
+                label, votes = Counter(known).most_common(1)[0]
+                if votes >= 2:
+                    cv2.putText(frame, f"Authenticated: {label}", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 220, 120), 2)
+                    cv2.imshow("Face PDF Auth", frame)
+                    cv2.waitKey(250)
+                    return label
+
+            remaining = max(0, int(deadline - time.time()))
+            cv2.putText(frame, f"Face auth for PDF unlock | timeout {remaining}s", (20, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (240, 240, 240), 2)
+            cv2.imshow("Face PDF Auth", frame)
+            key = cv2.waitKey(1) & 0xFF
+            if key in (27, ord("q")):
+                break
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+
+    return None
+
+
+def unlock_pdf_with_face(
+    store: SecureFaceStore,
+    encrypted_pdf: Path,
+    camera_index: int,
+    threshold: float,
+    detector_mode: str,
+    timeout_seconds: int,
+    output_pdf: Optional[Path],
+) -> Path:
+    if not encrypted_pdf.exists():
+        raise FileNotFoundError(f"Encrypted PDF not found: {encrypted_pdf}")
+
+    rec = store.get_encrypted_pdf_record(encrypted_pdf)
+    if not rec:
+        raise RuntimeError("Encrypted PDF metadata not found in secure store. Encrypt via this app first.")
+
+    person = authenticate_face_once(
+        store=store,
+        camera_index=camera_index,
+        threshold=threshold,
+        detector_mode=detector_mode,
+        timeout_seconds=timeout_seconds,
+    )
+    if not person:
+        store.append_audit_event(label="unknown", confidence=999.0, unlocked=False, event_type="pdf_unlock_failed")
+        raise RuntimeError("Face authentication failed or timed out.")
+
+    if person.strip().lower() != rec["owner"]:
+        store.append_audit_event(label=person, confidence=999.0, unlocked=False, event_type="pdf_unlock_denied")
+        raise PermissionError(f"Authenticated as '{person}', but this PDF is owned by '{rec['owner']}'.")
+
+    file_key = base64.urlsafe_b64decode(rec["key_b64"].encode("utf-8"))
+    decrypted = Fernet(file_key).decrypt(encrypted_pdf.read_bytes())
+
+    if output_pdf:
+        out = output_pdf
+    else:
+        tmp = Path(tempfile.gettempdir()) / f"face_unlock_{int(time.time())}_{rec['original_name']}"
+        out = tmp
+
+    out.write_bytes(decrypted)
+    store.append_audit_event(label=person, confidence=0.0, unlocked=True, event_type="pdf_unlock_success")
+    return out
 
 
 class FaceDetector:
@@ -565,6 +720,16 @@ def parse_args() -> argparse.Namespace:
 
     sub.add_parser("verify-audit", help="Verify tamper-evident audit chain")
 
+    encrypt_pdf = sub.add_parser("encrypt-pdf", help="Encrypt a PDF and bind unlock to an enrolled face")
+    encrypt_pdf.add_argument("--pdf", type=Path, required=True, help="Source PDF path")
+    encrypt_pdf.add_argument("--owner", required=True, help="Enrolled owner name required for unlock")
+    encrypt_pdf.add_argument("--out", type=Path, default=None, help="Output encrypted PDF path (.facepdf)")
+
+    unlock_pdf = sub.add_parser("unlock-pdf", help="Face-auth unlock an encrypted PDF and open it")
+    unlock_pdf.add_argument("--file", type=Path, required=True, help="Encrypted PDF path (.facepdf)")
+    unlock_pdf.add_argument("--timeout", type=int, default=25, help="Face auth timeout in seconds")
+    unlock_pdf.add_argument("--out", type=Path, default=None, help="Optional decrypted PDF output path")
+
     return parser.parse_args()
 
 
@@ -580,6 +745,27 @@ def main() -> None:
     if args.command == "verify-audit":
         ok = store.verify_audit_chain()
         print("Audit chain OK" if ok else "Audit chain FAILED")
+        return
+
+    if args.command == "encrypt-pdf":
+        out = encrypt_pdf_with_face(store, pdf_path=args.pdf, output_path=args.out, owner=args.owner)
+        print(f"Encrypted PDF created: {out}")
+        print("Use unlock-pdf to trigger camera auth and open the file.")
+        return
+
+    if args.command == "unlock-pdf":
+        out = unlock_pdf_with_face(
+            store=store,
+            encrypted_pdf=args.file,
+            camera_index=args.camera_index,
+            threshold=args.threshold,
+            detector_mode=args.detector,
+            timeout_seconds=args.timeout,
+            output_pdf=args.out,
+        )
+        print(f"PDF unlocked to: {out}")
+        webbrowser.open(out.resolve().as_uri())
+        print("Opened with default PDF handler (Chrome/reader depending on your OS defaults).")
         return
 
     if args.command == "delete":
