@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import pickle
+import secrets
 import tempfile
 import time
 import urllib.request
@@ -222,11 +223,19 @@ class SecureFaceStore:
         self.file_registry_file.write_bytes(self.cipher.encrypt(payload))
         os.chmod(self.file_registry_file, 0o600)
 
-    def register_encrypted_pdf(self, encrypted_path: Path, owner: str, file_key: bytes, original_name: str) -> None:
+    def register_encrypted_pdf(
+        self,
+        encrypted_path: Path,
+        owner: str,
+        original_name: str,
+        mode: str,
+        secret_value: str,
+    ) -> None:
         registry = self._load_file_registry()
         registry[str(encrypted_path.resolve())] = {
             "owner": owner.strip().lower(),
-            "key_b64": base64.urlsafe_b64encode(file_key).decode("utf-8"),
+            "mode": mode,
+            "secret": secret_value,
             "original_name": original_name,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -246,14 +255,30 @@ def encrypt_pdf_with_face(store: SecureFaceStore, pdf_path: Path, output_path: O
     if owner_norm not in samples:
         raise ValueError(f"Owner '{owner}' is not enrolled. Enroll first.")
 
-    out = output_path or pdf_path.with_suffix(".facepdf")
-    raw_pdf = pdf_path.read_bytes()
-    file_key = Fernet.generate_key()
-    encrypted_pdf = Fernet(file_key).encrypt(raw_pdf)
-    out.write_bytes(encrypted_pdf)
+    # Portable mode: produce a standards-compliant password-protected PDF
+    # that can be shared/opened on mobile readers.
+    from pypdf import PdfReader, PdfWriter
 
-    store.register_encrypted_pdf(out, owner=owner_norm, file_key=file_key, original_name=pdf_path.name)
-    store.append_audit_event(label=owner_norm, confidence=0.0, unlocked=False, event_type="encrypt_pdf")
+    out = output_path or pdf_path.with_name(f"{pdf_path.stem}_locked.pdf")
+    reader = PdfReader(str(pdf_path))
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    pdf_password = secrets.token_urlsafe(12)
+    writer.encrypt(pdf_password)
+    with out.open("wb") as f:
+        writer.write(f)
+
+    encrypted_secret = store.cipher.encrypt(pdf_password.encode("utf-8")).decode("utf-8")
+    store.register_encrypted_pdf(
+        out,
+        owner=owner_norm,
+        original_name=pdf_path.name,
+        mode="pdf_password",
+        secret_value=encrypted_secret,
+    )
+    store.append_audit_event(label=owner_norm, confidence=0.0, unlocked=False, event_type="encrypt_pdf_portable")
     return out
 
 
@@ -326,6 +351,7 @@ def unlock_pdf_with_face(
     detector_mode: str,
     timeout_seconds: int,
     output_pdf: Optional[Path],
+    print_password: bool = False,
 ) -> Path:
     if not encrypted_pdf.exists():
         raise FileNotFoundError(f"Encrypted PDF not found: {encrypted_pdf}")
@@ -349,17 +375,32 @@ def unlock_pdf_with_face(
         store.append_audit_event(label=person, confidence=999.0, unlocked=False, event_type="pdf_unlock_denied")
         raise PermissionError(f"Authenticated as '{person}', but this PDF is owned by '{rec['owner']}'.")
 
-    file_key = base64.urlsafe_b64decode(rec["key_b64"].encode("utf-8"))
-    decrypted = Fernet(file_key).decrypt(encrypted_pdf.read_bytes())
+    mode = rec.get("mode", "pdf_password")
+    if mode != "pdf_password":
+        raise RuntimeError(f"Unsupported PDF record mode: {mode}")
+
+    from pypdf import PdfReader, PdfWriter
+
+    pdf_password = store.cipher.decrypt(rec["secret"].encode("utf-8")).decode("utf-8")
+    if print_password:
+        print(f"PDF password (share for mobile open): {pdf_password}")
+
+    reader = PdfReader(str(encrypted_pdf))
+    if reader.is_encrypted:
+        reader.decrypt(pdf_password)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
 
     if output_pdf:
         out = output_pdf
     else:
-        tmp = Path(tempfile.gettempdir()) / f"face_unlock_{int(time.time())}_{rec['original_name']}"
-        out = tmp
+        out = Path(tempfile.gettempdir()) / f"face_unlock_{int(time.time())}_{rec['original_name']}"
 
-    out.write_bytes(decrypted)
-    store.append_audit_event(label=person, confidence=0.0, unlocked=True, event_type="pdf_unlock_success")
+    with out.open("wb") as f:
+        writer.write(f)
+
+    store.append_audit_event(label=person, confidence=0.0, unlocked=True, event_type="pdf_unlock_success_portable")
     return out
 
 
@@ -720,15 +761,20 @@ def parse_args() -> argparse.Namespace:
 
     sub.add_parser("verify-audit", help="Verify tamper-evident audit chain")
 
-    encrypt_pdf = sub.add_parser("encrypt-pdf", help="Encrypt a PDF and bind unlock to an enrolled face")
+    encrypt_pdf = sub.add_parser("encrypt-pdf", help="Create shareable password-protected PDF bound to an enrolled face")
     encrypt_pdf.add_argument("--pdf", type=Path, required=True, help="Source PDF path")
     encrypt_pdf.add_argument("--owner", required=True, help="Enrolled owner name required for unlock")
-    encrypt_pdf.add_argument("--out", type=Path, default=None, help="Output encrypted PDF path (.facepdf)")
+    encrypt_pdf.add_argument("--out", type=Path, default=None, help="Output locked PDF path (default: *_locked.pdf)")
 
-    unlock_pdf = sub.add_parser("unlock-pdf", help="Face-auth unlock an encrypted PDF and open it")
-    unlock_pdf.add_argument("--file", type=Path, required=True, help="Encrypted PDF path (.facepdf)")
+    unlock_pdf = sub.add_parser("unlock-pdf", help="Face-auth unlock a locked PDF and open it")
+    unlock_pdf.add_argument("--file", type=Path, required=True, help="Locked PDF path")
     unlock_pdf.add_argument("--timeout", type=int, default=25, help="Face auth timeout in seconds")
     unlock_pdf.add_argument("--out", type=Path, default=None, help="Optional decrypted PDF output path")
+    unlock_pdf.add_argument(
+        "--print-password",
+        action="store_true",
+        help="Print locked PDF password after successful face auth (for mobile sharing)",
+    )
 
     return parser.parse_args()
 
@@ -762,6 +808,7 @@ def main() -> None:
             detector_mode=args.detector,
             timeout_seconds=args.timeout,
             output_pdf=args.out,
+            print_password=args.print_password,
         )
         print(f"PDF unlocked to: {out}")
         webbrowser.open(out.resolve().as_uri())

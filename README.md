@@ -21,26 +21,31 @@ This build includes Android-style enrollment, stronger unlock logic, **privacy m
   ```
 - Runtime lockout/backoff after repeated failures (temporary lock window).
 
-## Face-locked PDF feature (new)
+## Face-locked PDF feature (shareable/mobile-friendly)
 
 You can encrypt a PDF and require face authentication to unlock/open it.
 
 ### 1) Encrypt PDF (bind to enrolled owner)
 
 ```bash
-python app.py encrypt-pdf --pdf "C:/docs/secret.pdf" --owner "akhilesh" --out "C:/docs/secret.facepdf"
+python app.py encrypt-pdf --pdf "C:/docs/secret.pdf" --owner "akhilesh" --out "C:/docs/secret_locked.pdf"
 ```
 
 ### 2) Unlock PDF with face (camera auto-triggers)
 
 ```bash
-python app.py unlock-pdf --file "C:/docs/secret.facepdf" --timeout 25
+python app.py unlock-pdf --file "C:/docs/secret_locked.pdf" --timeout 25
 ```
 
 - This command opens the camera, performs face authentication, decrypts the PDF, and opens it with the **default OS PDF handler** (Chrome or any reader depending on your system).
+- The locked output is a **standard password-protected PDF**, so it is easy to share and can open on mobile PDF apps too (with password).
+- To share for mobile open after face-auth, print password:
+  ```bash
+  python app.py unlock-pdf --file "C:/docs/secret_locked.pdf" --print-password
+  ```
 - Optional:
   ```bash
-  python app.py unlock-pdf --file "C:/docs/secret.facepdf" --out "C:/docs/decrypted_secret.pdf"
+  python app.py unlock-pdf --file "C:/docs/secret_locked.pdf" --out "C:/docs/decrypted_secret.pdf"
   ```
 
 > Note: Directly intercepting *any random* double-click/open in third-party PDF readers is OS-level integration. This app provides a secure launcher flow (`unlock-pdf`) that triggers camera automatically before opening.
